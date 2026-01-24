@@ -32,7 +32,11 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
 
         self.plotter = Plotter()
         self.fig0, self.ax0 = plt.subplots(1, 1)
-        self.fig1, self.ax1 = plt.subplots(len(self.cfg["system_dynamics_state_idx_dict"]) + 4, self.cfg["system_dynamics_num_visualizations"], figsize=(10 * self.cfg["system_dynamics_num_visualizations"], 10))
+        # Only create visualization plots if num_visualizations > 0
+        if self.cfg["system_dynamics_num_visualizations"] > 0:
+            self.fig1, self.ax1 = plt.subplots(len(self.cfg["system_dynamics_state_idx_dict"]) + 4, self.cfg["system_dynamics_num_visualizations"], figsize=(10 * self.cfg["system_dynamics_num_visualizations"], 10))
+        else:
+            self.fig1, self.ax1 = None, None
 
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -254,29 +258,33 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             state_traj_pred = self.state_normalizer.inverse(state_traj_pred)
             action_traj_pred = self.action_normalizer.inverse(action_traj_pred)
             self.writer.add_scalar("System Dynamics/autoregressive_error", traj_autoregressive_error, locs["it"])
-            self.plotter.plot_trajectories(
-                self.ax1,
-                None,
-                state_traj[:self.cfg["system_dynamics_num_visualizations"]],
-                action_traj[:self.cfg["system_dynamics_num_visualizations"]],
-                extension_traj[:self.cfg["system_dynamics_num_visualizations"]] if extension_traj is not None else None,
-                contact_traj[:self.cfg["system_dynamics_num_visualizations"]] if contact_traj is not None else None,
-                termination_traj[:self.cfg["system_dynamics_num_visualizations"]] if termination_traj is not None else None,
-                self.cfg["system_dynamics_state_idx_dict"],
-                )
-            self.plotter.plot_trajectories(
-                self.ax1,
-                self.alg.system_dynamics.history_horizon,
-                state_traj_pred[:self.cfg["system_dynamics_num_visualizations"]],
-                action_traj_pred[:self.cfg["system_dynamics_num_visualizations"]],
-                extension_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if extension_traj_pred is not None else None,
-                contact_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if contact_traj_pred is not None else None,
-                termination_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if termination_traj_pred is not None else None,
-                self.cfg["system_dynamics_state_idx_dict"],
-                prediction=True
-                )
-            self.fig1.align_ylabels()
-            self.writer.add_figure("System Dynamics/trajectories", self.fig1, locs["it"])
+            
+            # Only plot visualizations if enabled (num_visualizations > 0)
+            if self.cfg["system_dynamics_num_visualizations"] > 0:
+                self.plotter.plot_trajectories(
+                    self.ax1,
+                    None,
+                    state_traj[:self.cfg["system_dynamics_num_visualizations"]],
+                    action_traj[:self.cfg["system_dynamics_num_visualizations"]],
+                    extension_traj[:self.cfg["system_dynamics_num_visualizations"]] if extension_traj is not None else None,
+                    contact_traj[:self.cfg["system_dynamics_num_visualizations"]] if contact_traj is not None else None,
+                    termination_traj[:self.cfg["system_dynamics_num_visualizations"]] if termination_traj is not None else None,
+                    self.cfg["system_dynamics_state_idx_dict"],
+                    )
+                self.plotter.plot_trajectories(
+                    self.ax1,
+                    self.alg.system_dynamics.history_horizon,
+                    state_traj_pred[:self.cfg["system_dynamics_num_visualizations"]],
+                    action_traj_pred[:self.cfg["system_dynamics_num_visualizations"]],
+                    extension_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if extension_traj_pred is not None else None,
+                    contact_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if contact_traj_pred is not None else None,
+                    termination_traj_pred[:self.cfg["system_dynamics_num_visualizations"]] if termination_traj_pred is not None else None,
+                    self.cfg["system_dynamics_state_idx_dict"],
+                    prediction=True
+                    )
+                self.fig1.align_ylabels()
+                self.writer.add_figure("System Dynamics/trajectories", self.fig1, locs["it"])
+            
             for noise_scale, value in traj_autoregressive_error_noised_dict.items():
                 self.writer.add_scalar(f"System Dynamics/autoregressive_error_noised_{noise_scale}", value, locs["it"])
 
