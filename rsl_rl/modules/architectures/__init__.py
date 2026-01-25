@@ -1,2 +1,2 @@
-from .mlp import MLPBase, MLPStateHead, MLPAuxiliaryHead
+from .mlp import MLPBase, MLPStateHead, MLPStateHeadWithPrior, MLPAuxiliaryHead
 from .rnn import RNNBase

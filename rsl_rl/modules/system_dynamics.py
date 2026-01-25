@@ -1,8 +1,32 @@
 import torch
 import torch.nn as nn
-from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPAuxiliaryHead
+from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPStateHeadWithPrior, MLPAuxiliaryHead
 
 class SystemDynamicsEnsemble(nn.Module):
+    """
+    Ensemble of world models for model-based RL.
+    
+    Supports randomized priors for ensemble diversity (Osband et al., 2018).
+    When prior_scale > 0, each ensemble member uses MLPStateHeadWithPrior which
+    adds a frozen random network output to the trainable predictions. This
+    prevents ensemble collapse in low-data or sparse reward settings.
+    
+    Args:
+        state_dim: State dimension.
+        action_dim: Action dimension.
+        extension_dim: Extension output dimension (0 to disable).
+        contact_dim: Contact prediction dimension (0 to disable).
+        termination_dim: Termination prediction dimension (0 to disable).
+        device: Device to place tensors on.
+        ensemble_size: Number of ensemble members (default 1 = single model).
+        history_horizon: Number of past timesteps to condition on.
+        architecture_config: Dict specifying network architecture.
+        freeze_auxiliary: Whether to freeze auxiliary heads.
+        uncertainty_metric: "std" (original) or "variance" (theoretically sound).
+        prior_scale: Scale for randomized priors (0 = disabled, 1.0 = standard).
+        prior_hidden_div: Divisor for prior hidden dims (default 4).
+    """
+    
     def __init__(
         self,
         state_dim: int,
@@ -16,6 +40,8 @@ class SystemDynamicsEnsemble(nn.Module):
         architecture_config: dict = None,
         freeze_auxiliary: bool = False,
         uncertainty_metric: str = "std",
+        prior_scale: float = 0.0,
+        prior_hidden_div: int = 4,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -32,19 +58,38 @@ class SystemDynamicsEnsemble(nn.Module):
         # - std: same units as state, milder penalty
         # - variance: additive across dimensions, stronger penalty for high disagreement
         self.uncertainty_metric = uncertainty_metric
+        # Randomized priors for ensemble diversity (Osband et al., 2018)
+        # - prior_scale=0: disabled (original behavior)
+        # - prior_scale>0: each head adds frozen random network output to means
+        self.prior_scale = prior_scale
+        self.prior_hidden_div = prior_hidden_div
         
         self._init_networks()
 
     def _init_networks(self):
         self.state_base = self._create_base()
-        self.state_heads = nn.ModuleList([
-            MLPStateHead(
-                self.base_output_dim,
-                self.state_dim,
-                self.device,
-                self.architecture_config
-            ).to(self.device) for _ in range(self.ensemble_size)
-        ])
+        
+        # Use MLPStateHeadWithPrior when prior_scale > 0, else standard MLPStateHead
+        if self.prior_scale > 0:
+            self.state_heads = nn.ModuleList([
+                MLPStateHeadWithPrior(
+                    self.base_output_dim,
+                    self.state_dim,
+                    self.device,
+                    self.architecture_config,
+                    prior_scale=self.prior_scale,
+                    prior_hidden_div=self.prior_hidden_div,
+                ).to(self.device) for _ in range(self.ensemble_size)
+            ])
+        else:
+            self.state_heads = nn.ModuleList([
+                MLPStateHead(
+                    self.base_output_dim,
+                    self.state_dim,
+                    self.device,
+                    self.architecture_config
+                ).to(self.device) for _ in range(self.ensemble_size)
+            ])
 
         self.auxiliary_base = self._create_base()
         self.auxiliary_heads = nn.ModuleList([

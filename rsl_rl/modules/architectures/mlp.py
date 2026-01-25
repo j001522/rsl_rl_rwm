@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import copy
 
 
 class MLPBase(nn.Module):
@@ -91,6 +92,152 @@ class MLPStateHead(nn.Module):
         if sequence_len > 0:
             state_mean = state_mean.view(-1, sequence_len, self.state_dim)
             state_logstd = state_logstd.view(-1, sequence_len, self.state_dim)
+        return state_mean, torch.exp(state_logstd)
+
+    def reset(self):
+        pass
+
+
+class MLPStateHeadWithPrior(nn.Module):
+    """
+    MLP State Head with randomized prior for ensemble diversity.
+    
+    Based on "Randomized Prior Functions for Deep Reinforcement Learning" (Osband et al.).
+    The prior network is a frozen copy of the mean network with Xavier initialization.
+    Its output is detached (no gradient flow) and added to the trainable mean output.
+    
+    This encourages diverse predictions across ensemble members, preventing collapse
+    to identical predictions in sparse reward or low-data regimes.
+    
+    Key design decisions:
+    - Prior only applies to MEANS, not variances (std). This preserves the learned
+      uncertainty estimates while diversifying point predictions.
+    - Prior is added BEFORE the residual state connection (next = delta + current),
+      so it perturbs the predicted delta, not the absolute state.
+    - Prior network uses smaller hidden dims (hidden_dim // prior_hidden_div) to
+      reduce compute while maintaining diversity.
+    
+    Args:
+        input_dim: Input dimension (from base network output).
+        state_dim: State dimension to predict.
+        device: Device to place tensors on.
+        architecture_config: Dict with 'state_mean_shape' and 'state_logstd_shape'.
+        prior_scale: Scale factor for prior output. 0 = no prior (same as MLPStateHead).
+        prior_hidden_div: Divisor for prior hidden dimensions (default 4).
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        state_dim: int,
+        device: str,
+        architecture_config: dict = None,
+        prior_scale: float = 1.0,
+        prior_hidden_div: int = 4,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.state_dim = state_dim
+        self.device = device
+        self.prior_scale = prior_scale
+        self.prior_hidden_div = prior_hidden_div
+        
+        self.state_mean_shape = architecture_config["state_mean_shape"]
+        self.state_logstd_shape = architecture_config["state_logstd_shape"]
+
+        # --- 1. Main Trainable Mean Network ---
+        state_mean_layers = []
+        curr_in_dim = self.input_dim
+        for hidden_dim in self.state_mean_shape:
+            state_mean_layers.append(nn.Linear(curr_in_dim, hidden_dim))
+            state_mean_layers.append(nn.ReLU())
+            curr_in_dim = hidden_dim
+        state_mean_layers.append(nn.Linear(self.state_mean_shape[-1], state_dim))
+        self.state_mean_layers = nn.Sequential(*state_mean_layers).to(self.device)
+        self.state_mean_layers.train()
+
+        # --- 2. Random Prior Network for Mean (frozen, detached output) ---
+        if self.prior_scale > 0:
+            # Use smaller hidden dims for prior (reduces compute, maintains diversity)
+            prior_hidden_dims = [max(h // prior_hidden_div, 8) for h in self.state_mean_shape]
+            prior_layers = []
+            curr_in_dim = self.input_dim
+            for hidden_dim in prior_hidden_dims:
+                prior_layers.append(nn.Linear(curr_in_dim, hidden_dim))
+                prior_layers.append(nn.ReLU())
+                curr_in_dim = hidden_dim
+            prior_layers.append(nn.Linear(prior_hidden_dims[-1], state_dim))
+            self.prior_mean_layers = nn.Sequential(*prior_layers).to(self.device)
+            
+            # Initialize with Xavier/Glorot (as per Osband et al.)
+            for m in self.prior_mean_layers.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    nn.init.zeros_(m.bias)
+            
+            # Note: We don't set requires_grad=False to avoid issues with torch.compile.
+            # Instead, we detach the output in forward() to block gradient flow.
+        else:
+            self.prior_mean_layers = None
+
+        # --- 3. LogStd Network (unchanged, no prior) ---
+        if self.state_logstd_shape is not None:
+            self.output_std = True
+            state_logstd_layers = []
+            curr_in_dim = self.input_dim
+            for hidden_dim in self.state_logstd_shape:
+                state_logstd_layers.append(nn.Linear(curr_in_dim, hidden_dim))
+                state_logstd_layers.append(nn.ReLU())
+                curr_in_dim = hidden_dim
+            state_logstd_layers.append(nn.Linear(self.state_logstd_shape[-1], state_dim))
+            self.state_logstd_layers = nn.Sequential(*state_logstd_layers).to(self.device)
+            self.state_logstd_layers.train()
+        else:
+            self.output_std = False
+
+        if self.output_std:
+            self.state_min_logstd = nn.Parameter(torch.ones(1, state_dim, device=self.device) * -5.0)
+            self.state_log_delta_logstd = nn.Parameter(torch.ones(1, state_dim, device=self.device) * 0.0)
+
+    def forward(self, x, x_state_batch):
+        # Handle sequence dimension
+        if x.dim() == 3:
+            sequence_len = x.shape[1]
+            x = x.flatten(0, 1)
+            x_state_batch = x_state_batch.flatten(0, 1).unsqueeze(1)
+        else:
+            sequence_len = 0
+
+        # --- Forward Pass: Mean with Prior ---
+        # 1. Compute trainable mean output (delta)
+        trainable_delta = self.state_mean_layers(x)
+
+        # 2. Add prior perturbation (if active)
+        if self.prior_mean_layers is not None:
+            with torch.no_grad():
+                prior_out = self.prior_mean_layers(x)
+            # Detach to ensure no gradient flow to prior params
+            prior_out = prior_out.detach()
+            # Add scaled prior to trainable delta
+            trainable_delta = trainable_delta + prior_out * self.prior_scale
+
+        # 3. Add residual connection: next_state = current_state + delta
+        state_mean = trainable_delta + x_state_batch[:, -1]
+
+        # --- Forward Pass: Std (unchanged, no prior) ---
+        if self.output_std:
+            state_logstd = self.state_logstd_layers(x)
+            self.state_max_logstd = self.state_min_logstd + torch.exp(self.state_log_delta_logstd)
+            state_logstd = self.state_max_logstd - nn.functional.softplus(self.state_max_logstd - state_logstd)
+            state_logstd = self.state_min_logstd + nn.functional.softplus(state_logstd - self.state_min_logstd)
+        else:
+            state_logstd = -torch.inf * torch.ones(x.shape[0], self.state_dim, device=self.device)
+        
+        # Reshape for sequence output
+        if sequence_len > 0:
+            state_mean = state_mean.view(-1, sequence_len, self.state_dim)
+            state_logstd = state_logstd.view(-1, sequence_len, self.state_dim)
+            
         return state_mean, torch.exp(state_logstd)
 
     def reset(self):
