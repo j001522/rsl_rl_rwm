@@ -42,6 +42,7 @@ class SystemDynamicsEnsemble(nn.Module):
         uncertainty_metric: str = "std",
         prior_scale: float = 0.0,
         prior_hidden_div: int = 4,
+        bootstrap: bool = True,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -63,6 +64,9 @@ class SystemDynamicsEnsemble(nn.Module):
         # - prior_scale>0: each head adds frozen random network output to means
         self.prior_scale = prior_scale
         self.prior_hidden_div = prior_hidden_div
+        # Bootstrap: each ensemble member trains on random data subset
+        # With random priors, bootstrapping may be unnecessary
+        self.bootstrap = bootstrap
         
         self._init_networks()
 

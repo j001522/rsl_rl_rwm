@@ -210,7 +210,7 @@ class MBPOPPO(PPO):
                 system_extension_batch,
                 system_contact_batch,
                 system_termination_batch,
-                bootstrap=True
+                bootstrap=self.system_dynamics.bootstrap
             )
             loss = (
                 self.system_dynamics_loss_weights["state"] * state_loss
