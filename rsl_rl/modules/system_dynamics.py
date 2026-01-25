@@ -15,6 +15,7 @@ class SystemDynamicsEnsemble(nn.Module):
         history_horizon: int = 1,
         architecture_config: dict = None,
         freeze_auxiliary: bool = False,
+        uncertainty_metric: str = "std",
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -27,6 +28,10 @@ class SystemDynamicsEnsemble(nn.Module):
         self.history_horizon = history_horizon
         self.architecture_config = architecture_config
         self.freeze_auxiliary = freeze_auxiliary
+        # Uncertainty metric: "std" (original) or "variance" (more theoretically sound)
+        # - std: same units as state, milder penalty
+        # - variance: additive across dimensions, stronger penalty for high disagreement
+        self.uncertainty_metric = uncertainty_metric
         
         self._init_networks()
 
@@ -123,7 +128,15 @@ class SystemDynamicsEnsemble(nn.Module):
             output_terminations = torch.gather(terminations, 0, model_ids.repeat(1, 1, self.termination_dim)).squeeze(0) if terminations is not None else None
         
         aleatoric_uncertainty = state_stds.mean(dim=0).sum(dim=1)
-        epistemic_uncertainty = state_means.std(dim=0).sum(dim=1) if self.ensemble_size > 1 else torch.zeros(output_state_means.shape[0], device=self.device)
+        if self.ensemble_size > 1:
+            if self.uncertainty_metric == "variance":
+                # Variance: more theoretically sound, additive across dimensions
+                epistemic_uncertainty = state_means.var(dim=0).sum(dim=1)
+            else:
+                # Std (default): same units as state, original implementation
+                epistemic_uncertainty = state_means.std(dim=0).sum(dim=1)
+        else:
+            epistemic_uncertainty = torch.zeros(output_state_means.shape[0], device=self.device)
         return output_state_means, aleatoric_uncertainty, epistemic_uncertainty, output_extensions, output_contacts, output_terminations
 
     def compute_loss(self, state_batch, action_batch, extension_batch, contact_batch, termination_batch, bootstrap=False):
