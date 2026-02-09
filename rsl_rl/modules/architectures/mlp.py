@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import copy
 
+from rsl_rl.modules.architectures.latent_layers import SimNorm, NormedLinear, latent_mlp
+
 
 class MLPBase(nn.Module):
     def __init__(
@@ -96,6 +98,130 @@ class MLPStateHead(nn.Module):
 
     def reset(self):
         pass
+
+
+class LatentDynamicsHead(nn.Module):
+    """Dynamics head that predicts next latent state with SimNorm output.
+    
+    Unlike MLPStateHead which predicts raw state deltas with a residual
+    connection (next = current + delta), this head directly predicts the
+    next latent state and applies SimNorm to keep it on the simplex.
+    
+    Supports randomized priors (Osband et al.) for ensemble diversity,
+    following the same pattern as DynamicsHeadWithPrior in TD-MPC2:
+    the prior perturbation is added BEFORE SimNorm, so both learned
+    prediction and diversity noise are jointly normalized.
+    
+    This head does NOT predict uncertainty (std). Uncertainty in latent
+    mode comes purely from ensemble disagreement (epistemic uncertainty).
+    
+    Args:
+        input_dim: Input dimension (from base network output).
+        latent_dim: Latent state dimension to predict.
+        device: Device to place tensors on.
+        architecture_config: Dict with 'latent_head_hidden_dims' key.
+        simnorm_dim: SimNorm group size (default: 8).
+        prior_scale: Scale for randomized prior output (0 = disabled).
+        prior_hidden_div: Divisor for prior hidden dimensions (default: 4).
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        device: str,
+        architecture_config: dict = None,
+        simnorm_dim: int = 8,
+        prior_scale: float = 0.0,
+        prior_hidden_div: int = 4,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.device = device
+        self.prior_scale = prior_scale
+        self.prior_hidden_div = prior_hidden_div
+        self.output_std = False  # Latent heads don't predict std
+        
+        hidden_dims = architecture_config.get("latent_head_hidden_dims", [256])
+        
+        # Main trainable MLP (no output activation -- SimNorm applied after prior)
+        self.main_mlp = latent_mlp(
+            in_dim=input_dim,
+            hidden_dims=hidden_dims,
+            out_dim=latent_dim,
+            output_act=None,
+        ).to(self.device)
+        
+        # Random prior network (frozen output, detached gradients)
+        if self.prior_scale > 0:
+            prior_hidden_dims = [max(h // prior_hidden_div, 8) for h in hidden_dims]
+            prior_layers = []
+            curr_in_dim = input_dim
+            for hidden_dim in prior_hidden_dims:
+                prior_layers.append(nn.Linear(curr_in_dim, hidden_dim))
+                prior_layers.append(nn.ReLU())
+                curr_in_dim = hidden_dim
+            prior_layers.append(nn.Linear(prior_hidden_dims[-1], latent_dim))
+            self.prior_mlp = nn.Sequential(*prior_layers).to(self.device)
+            
+            # Xavier initialization for prior
+            for m in self.prior_mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    nn.init.zeros_(m.bias)
+        else:
+            self.prior_mlp = None
+        
+        # SimNorm applied after main + prior
+        self.simnorm = SimNorm(simnorm_dim).to(self.device)
+    
+    def forward(self, x, x_state_batch=None):
+        """Predict next latent state.
+        
+        Args:
+            x: Base network output, shape [batch, base_dim] or [batch, seq, base_dim].
+            x_state_batch: Ignored (kept for API compatibility with MLPStateHead).
+                          Latent dynamics has no residual connection.
+        
+        Returns:
+            (latent_mean, latent_std): Tuple where latent_mean has shape
+                [batch, latent_dim] and latent_std is zeros (no aleatoric
+                uncertainty in latent space).
+        """
+        # Handle sequence dimension
+        if x.dim() == 3:
+            sequence_len = x.shape[1]
+            x = x.flatten(0, 1)
+        else:
+            sequence_len = 0
+        
+        # Main prediction
+        out = self.main_mlp(x)
+        
+        # Add prior perturbation
+        if self.prior_mlp is not None:
+            with torch.no_grad():
+                prior_out = self.prior_mlp(x)
+            prior_out = prior_out.detach()
+            out = out + prior_out * self.prior_scale
+        
+        # Apply SimNorm (after prior, so both are jointly normalized)
+        latent_mean = self.simnorm(out)
+        
+        # No aleatoric uncertainty in latent space
+        latent_std = torch.zeros_like(latent_mean)
+        
+        # Reshape for sequence output
+        if sequence_len > 0:
+            latent_mean = latent_mean.view(-1, sequence_len, self.latent_dim)
+            latent_std = latent_std.view(-1, sequence_len, self.latent_dim)
+        
+        return latent_mean, latent_std
+    
+    def reset(self):
+        pass
+
 
 
 class MLPStateHeadWithPrior(nn.Module):
