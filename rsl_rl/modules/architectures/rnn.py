@@ -25,6 +25,10 @@ class RNNBase(nn.Module):
     
     def reset(self):
         self.memory.reset()
+    
+    def reset_partial(self, env_ids):
+        """Reset hidden states for specific environment indices."""
+        self.memory.reset_partial(env_ids)
 
 
 class Memory(nn.Module):
@@ -42,3 +46,9 @@ class Memory(nn.Module):
     
     def reset(self):
         self.hidden_states = None
+    
+    def reset_partial(self, env_ids):
+        """Reset hidden states for specific environment indices."""
+        if self.hidden_states is not None:
+            # hidden_states shape: (num_layers, batch, hidden_size)
+            self.hidden_states[:, env_ids, :] = 0.0
