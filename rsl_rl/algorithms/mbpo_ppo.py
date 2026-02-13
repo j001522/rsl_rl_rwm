@@ -196,6 +196,7 @@ class MBPOPPO(PPO):
         mean_system_kl_loss = 0
         mean_system_consistency_loss = 0
         mean_system_reconstruction_loss = 0
+        mean_system_encoder_consistency_loss = 0
         mean_system_extension_loss = 0
         mean_system_contact_loss = 0
         mean_system_termination_loss = 0
@@ -206,7 +207,7 @@ class MBPOPPO(PPO):
         )
         for system_state_batch, system_action_batch, system_extension_batch, system_contact_batch, system_termination_batch in system_generator:
             self.system_dynamics.reset()
-            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, extension_loss, contact_loss, termination_loss = self.system_dynamics.compute_loss(
+            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, extension_loss, contact_loss, termination_loss = self.system_dynamics.compute_loss(
                 system_state_batch,
                 system_action_batch,
                 system_extension_batch,
@@ -221,6 +222,7 @@ class MBPOPPO(PPO):
                 + self.system_dynamics_loss_weights["kl"] * kl_loss
                 + self.system_dynamics_loss_weights.get("consistency", 0.0) * consistency_loss
                 + self.system_dynamics_loss_weights.get("reconstruction", 0.0) * reconstruction_loss
+                + self.system_dynamics_loss_weights.get("encoder_consistency", 0.0) * encoder_consistency_loss
                 + self.system_dynamics_loss_weights["extension"] * extension_loss
                 + self.system_dynamics_loss_weights["contact"] * contact_loss
                 + self.system_dynamics_loss_weights["termination"] * termination_loss
@@ -229,12 +231,15 @@ class MBPOPPO(PPO):
             loss.backward()
             nn.utils.clip_grad_norm_(self.system_dynamics.parameters(), self.max_grad_norm)
             self.system_dynamics_optimizer.step()
+            # Update EMA target encoder after each optimizer step
+            self.system_dynamics.update_target_encoder()
             mean_system_state_loss += state_loss.item()
             mean_system_sequence_loss += sequence_loss.item()
             mean_system_bound_loss += bound_loss.item()
             mean_system_kl_loss += kl_loss.item()
             mean_system_consistency_loss += consistency_loss.item()
             mean_system_reconstruction_loss += reconstruction_loss.item()
+            mean_system_encoder_consistency_loss += encoder_consistency_loss.item()
             mean_system_extension_loss += extension_loss.item()
             mean_system_contact_loss += contact_loss.item()
             mean_system_termination_loss += termination_loss.item()
@@ -246,10 +251,11 @@ class MBPOPPO(PPO):
         mean_system_kl_loss /= system_dynamics_num_updates
         mean_system_consistency_loss /= system_dynamics_num_updates
         mean_system_reconstruction_loss /= system_dynamics_num_updates
+        mean_system_encoder_consistency_loss /= system_dynamics_num_updates
         mean_system_extension_loss /= system_dynamics_num_updates
         mean_system_contact_loss /= system_dynamics_num_updates
         mean_system_termination_loss /= system_dynamics_num_updates
-        return mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss
+        return mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss
     
     def evaluate_system_dynamics(self):
         system_generator = self.system_replay_buffer.mini_batch_generator(

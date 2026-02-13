@@ -129,7 +129,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                 # compute returns
                 self.alg.compute_returns(obs)
             
-            mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss = self.alg.update_system_dynamics()
+            mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss = self.alg.update_system_dynamics()
             # update policy
             if it >= start_iter + self.cfg["system_dynamics_warmup_iterations"]:
                 if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
@@ -245,6 +245,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         self.writer.add_scalar("System Dynamics/kl_loss", locs["mean_system_kl_loss"], locs["it"])
         self.writer.add_scalar("System Dynamics/consistency_loss", locs["mean_system_consistency_loss"], locs["it"])
         self.writer.add_scalar("System Dynamics/reconstruction_loss", locs["mean_system_reconstruction_loss"], locs["it"])
+        self.writer.add_scalar("System Dynamics/encoder_consistency_loss", locs["mean_system_encoder_consistency_loss"], locs["it"])
         if self.system_extension_dim > 0:
             self.writer.add_scalar("System Dynamics/extension_loss", locs["mean_system_extension_loss"], locs["it"])
         if self.system_contact_dim > 0:

@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPStateHeadWithPrior, MLPAuxiliaryHead
@@ -47,6 +48,12 @@ class SystemDynamicsEnsemble(nn.Module):
         encoder_dropout: Dropout rate for encoder (default 0.0).
         consistency_coef: Weight for consistency loss (default 2.0).
         reconstruction_coef: Weight for reconstruction loss (default 1.0).
+        target_encoder_momentum: EMA momentum for target encoder (default 0.99).
+            Only used when latent_mode=True. The target encoder parameters are
+            updated as: θ_target ← momentum * θ_target + (1 - momentum) * θ_online
+        encoder_consistency_coef: Weight for bidirectional encoder consistency loss
+            (default 0.0, disabled). When > 0, adds a loss term that trains the encoder
+            to produce representations consistent with dynamics predictions (TD-MPC2 style).
     """
     
     def __init__(
@@ -75,6 +82,8 @@ class SystemDynamicsEnsemble(nn.Module):
         encoder_dropout: float = 0.0,
         consistency_coef: float = 2.0,
         reconstruction_coef: float = 1.0,
+        target_encoder_momentum: float = 0.99,
+        encoder_consistency_coef: float = 0.0,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -102,6 +111,8 @@ class SystemDynamicsEnsemble(nn.Module):
         self.encoder_dropout = encoder_dropout
         self.consistency_coef = consistency_coef
         self.reconstruction_coef = reconstruction_coef
+        self.target_encoder_momentum = target_encoder_momentum
+        self.encoder_consistency_coef = encoder_consistency_coef
         
         self._init_networks()
 
@@ -124,6 +135,14 @@ class SystemDynamicsEnsemble(nn.Module):
         else:
             self.encoder = None
             self.decoder = None
+        
+        # --- EMA target encoder (latent mode only, Phase 2) ---
+        if self.latent_mode and self.encoder is not None:
+            self.target_encoder = copy.deepcopy(self.encoder)
+            for param in self.target_encoder.parameters():
+                param.requires_grad = False
+        else:
+            self.target_encoder = None
         
         # --- Base network (backbone) ---
         self.state_base = self._create_base()
@@ -243,6 +262,24 @@ class SystemDynamicsEnsemble(nn.Module):
         if self.latent_mode and self.decoder is not None:
             return self.decoder(latent_states)
         return latent_states
+
+    @torch.no_grad()
+    def update_target_encoder(self, momentum: float | None = None):
+        """Update target encoder parameters via exponential moving average.
+        
+        θ_target ← momentum * θ_target + (1 - momentum) * θ_online
+        
+        Only has an effect in latent mode. No-op if target_encoder is None.
+        
+        Args:
+            momentum: EMA momentum. If None, uses self.target_encoder_momentum.
+        """
+        if self.target_encoder is None:
+            return
+        if momentum is None:
+            momentum = self.target_encoder_momentum
+        for param_online, param_target in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+            param_target.data.mul_(momentum).add_(param_online.data, alpha=1.0 - momentum)
 
     def forward(self, x_state_batch, x_action_batch, model_ids=None):
         """Forward pass through the ensemble.
@@ -402,6 +439,7 @@ class SystemDynamicsEnsemble(nn.Module):
         kl_losses = []
         consistency_losses = []
         reconstruction_losses = []
+        encoder_consistency_losses = []
         extension_losses = []
         contact_losses = []
         termination_losses = []
@@ -412,7 +450,7 @@ class SystemDynamicsEnsemble(nn.Module):
             else:
                 ids = torch.arange(0, state_batch.shape[0], device=self.device)
             
-            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss = self.compute_state_loss(
+            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss = self.compute_state_loss(
                 self.state_heads[i], state_batch[ids], action_batch[ids]
             )
             
@@ -436,6 +474,7 @@ class SystemDynamicsEnsemble(nn.Module):
             kl_losses.append(kl_loss.unsqueeze(0))
             consistency_losses.append(consistency_loss.unsqueeze(0))
             reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
+            encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
             extension_losses.append(extension_loss.unsqueeze(0))
             contact_losses.append(contact_loss.unsqueeze(0))
             termination_losses.append(termination_loss.unsqueeze(0))
@@ -446,20 +485,23 @@ class SystemDynamicsEnsemble(nn.Module):
         kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
         consistency_loss = torch.mean(torch.cat(consistency_losses, dim=0), dim=0)
         reconstruction_loss = torch.mean(torch.cat(reconstruction_losses, dim=0), dim=0)
+        encoder_consistency_loss = torch.mean(torch.cat(encoder_consistency_losses, dim=0), dim=0)
         extension_loss = torch.mean(torch.cat(extension_losses, dim=0), dim=0)
         contact_loss = torch.mean(torch.cat(contact_losses, dim=0), dim=0)
         termination_loss = torch.mean(torch.cat(termination_losses, dim=0), dim=0)
-        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, extension_loss, contact_loss, termination_loss
+        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, extension_loss, contact_loss, termination_loss
 
     def compute_state_loss(self, head, state_batch, action_batch):
         """Compute state prediction loss for a single ensemble head.
         
         In latent mode, this computes:
-        - consistency_loss: MSE between predicted and target latent states
+        - consistency_loss: MSE between predicted latent and EMA target encoder output
         - reconstruction_loss: MSE between decoded prediction and raw target
+        - encoder_consistency_loss: (optional) MSE between online encoder output and 
+            stop-gradient dynamics prediction (bidirectional, TD-MPC2 style)
         - state_loss: weighted sum of the above (for backward compatibility)
         
-        In raw mode: unchanged from original behavior (consistency_loss=0, reconstruction_loss=0).
+        In raw mode: unchanged from original behavior (consistency/reconstruction/encoder_consistency = 0).
         """
         forecast_horizon = state_batch.shape[1] - self.history_horizon
         state_losses = []
@@ -468,21 +510,22 @@ class SystemDynamicsEnsemble(nn.Module):
         kl_losses = []
         consistency_losses = []
         reconstruction_losses = []
+        encoder_consistency_losses = []
         
         if self.latent_mode:
-            # Encode the full state batch once for targets
+            # Encode the full state batch with EMA target encoder for consistency targets
             with torch.no_grad():
-                all_latent_targets = self.encoder(state_batch)
+                all_latent_targets = self.target_encoder(state_batch)
             
-            # Encode initial history (with gradients for encoder training)
+            # Encode initial history with online encoder (with gradients for encoder training)
             x_latent_batch = self.encoder(state_batch[:, :self.history_horizon])
         else:
             x_state_batch = state_batch[:, :self.history_horizon]
         
         for i in range(forecast_horizon):
             if self.latent_mode:
-                # Target: encoded next state (detached for JEPA-style consistency)
-                latent_target = all_latent_targets[:, self.history_horizon + i].detach()
+                # Target: EMA target encoder output (JEPA-style consistency)
+                latent_target = all_latent_targets[:, self.history_horizon + i]
                 raw_target = state_batch[:, self.history_horizon + i]
                 
                 if self.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
@@ -494,17 +537,28 @@ class SystemDynamicsEnsemble(nn.Module):
                 base_output = self.state_base.forward(x_latent_batch, x_action_batch)
                 latent_pred, _ = head.forward(base_output, x_latent_batch)
                 
-                # Consistency loss: MSE in latent space (JEPA-style)
+                # Consistency loss: MSE between dynamics prediction and EMA target
                 consistency_loss = torch.sum(torch.square(latent_pred - latent_target), dim=1).mean(dim=0)
                 
                 # Reconstruction loss: decode predicted latent, compare to raw target
                 raw_pred = self.decoder(latent_pred)
                 reconstruction_loss = torch.sum(torch.square(raw_pred - raw_target), dim=1).mean(dim=0)
                 
+                # Bidirectional encoder consistency loss (TD-MPC2 style, optional)
+                # Trains the online encoder to produce outputs consistent with dynamics predictions
+                if self.encoder_consistency_coef > 0:
+                    online_next_latent = self.encoder(state_batch[:, self.history_horizon + i])
+                    encoder_consistency_loss = torch.sum(
+                        torch.square(online_next_latent - latent_pred.detach()), dim=1
+                    ).mean(dim=0)
+                else:
+                    encoder_consistency_loss = torch.tensor(0.0, device=self.device)
+                
                 # Combined state loss for backward compatibility
                 state_loss = (
                     self.consistency_coef * consistency_loss 
                     + self.reconstruction_coef * reconstruction_loss
+                    + self.encoder_consistency_coef * encoder_consistency_loss
                 )
                 sequence_loss = torch.tensor(0.0, device=self.device)
                 bound_loss = torch.tensor(0.0, device=self.device)
@@ -512,6 +566,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 
                 consistency_losses.append(consistency_loss.unsqueeze(0))
                 reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
+                encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
                 state_losses.append(state_loss.unsqueeze(0))
                 sequence_losses.append(sequence_loss.unsqueeze(0))
                 bound_losses.append(bound_loss.unsqueeze(0))
@@ -548,6 +603,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 
                 consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
                 reconstruction_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                encoder_consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
                 state_losses.append(state_loss.unsqueeze(0))
                 sequence_losses.append(sequence_loss.unsqueeze(0))
                 bound_losses.append(bound_loss.unsqueeze(0))
@@ -574,7 +630,8 @@ class SystemDynamicsEnsemble(nn.Module):
         kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
         consistency_loss = torch.mean(torch.cat(consistency_losses, dim=0), dim=0)
         reconstruction_loss = torch.mean(torch.cat(reconstruction_losses, dim=0), dim=0)
-        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss
+        encoder_consistency_loss = torch.mean(torch.cat(encoder_consistency_losses, dim=0), dim=0)
+        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss
 
     def compute_auxiliary_loss(self, head, state_batch, action_batch, extension_batch, contact_batch, termination_batch):
         """Compute auxiliary prediction losses.
@@ -701,4 +758,7 @@ class SystemDynamicsEnsemble(nn.Module):
             self.auxiliary_base.eval()
             for head in self.auxiliary_heads:
                 head.eval()
+        # Target encoder should always be in eval mode (no dropout/batchnorm train behavior)
+        if self.target_encoder is not None:
+            self.target_encoder.eval()
         return self
