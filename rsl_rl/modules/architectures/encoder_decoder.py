@@ -83,6 +83,10 @@ class StateDecoder(nn.Module):
         state_dim: Raw state observation dimension.
         hidden_dims: List of hidden layer widths (default: [256]).
         dropout: Dropout rate for hidden layers (default: 0.0).
+        residual: If True, enables residual prediction mode. The decoder receives
+            both the latent prediction and the current raw state (concatenated),
+            and predicts a delta that is added to the current state:
+            s_{t+1} = s_t + Decoder(concat(z_{t+1}, s_t)). Default: False.
     """
     
     def __init__(
@@ -91,6 +95,7 @@ class StateDecoder(nn.Module):
         state_dim: int,
         hidden_dims: list[int] | None = None,
         dropout: float = 0.0,
+        residual: bool = False,
     ):
         super().__init__()
         if hidden_dims is None:
@@ -98,22 +103,37 @@ class StateDecoder(nn.Module):
         
         self.latent_dim = latent_dim
         self.state_dim = state_dim
+        self.residual = residual
+        
+        # In residual mode, input is concat(latent, current_state)
+        in_dim = latent_dim + state_dim if residual else latent_dim
         
         self.net = latent_mlp(
-            in_dim=latent_dim,
+            in_dim=in_dim,
             hidden_dims=hidden_dims,
             out_dim=state_dim,
             output_act=None,  # plain Linear output for unconstrained state values
             dropout=dropout,
         )
     
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, current_state: torch.Tensor | None = None) -> torch.Tensor:
         """Decode latent representation to raw state.
         
         Args:
             z: Latent tensor of shape [..., latent_dim].
+            current_state: Current raw state tensor of shape [..., state_dim].
+                Required when residual=True. Ignored when residual=False.
             
         Returns:
             Reconstructed state of shape [..., state_dim].
+            In residual mode: current_state + delta.
+            In direct mode: absolute state prediction.
         """
+        if self.residual:
+            assert current_state is not None, (
+                "current_state is required when residual=True"
+            )
+            x = torch.cat([z, current_state], dim=-1)
+            delta = self.net(x)
+            return current_state + delta
         return self.net(z)

@@ -54,6 +54,9 @@ class SystemDynamicsEnsemble(nn.Module):
         encoder_consistency_coef: Weight for bidirectional encoder consistency loss
             (default 0.0, disabled). When > 0, adds a loss term that trains the encoder
             to produce representations consistent with dynamics predictions (TD-MPC2 style).
+        residual_decoder: If True, the decoder predicts a delta from the current state
+            instead of an absolute state: s_{t+1} = s_t + Decoder(concat(z_{t+1}, s_t)).
+            Only used when latent_mode=True. Default: False.
     """
     
     def __init__(
@@ -84,6 +87,7 @@ class SystemDynamicsEnsemble(nn.Module):
         reconstruction_coef: float = 1.0,
         target_encoder_momentum: float = 0.99,
         encoder_consistency_coef: float = 0.0,
+        residual_decoder: bool = False,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -113,6 +117,7 @@ class SystemDynamicsEnsemble(nn.Module):
         self.reconstruction_coef = reconstruction_coef
         self.target_encoder_momentum = target_encoder_momentum
         self.encoder_consistency_coef = encoder_consistency_coef
+        self.residual_decoder = residual_decoder
         
         self._init_networks()
 
@@ -131,6 +136,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 latent_dim=self.latent_dim,
                 state_dim=self.state_dim,
                 hidden_dims=self.decoder_hidden_dims,
+                residual=self.residual_decoder,
             ).to(self.device)
         else:
             self.encoder = None
@@ -249,18 +255,20 @@ class SystemDynamicsEnsemble(nn.Module):
             return self.encoder(raw_states)
         return raw_states
     
-    def decode(self, latent_states: torch.Tensor) -> torch.Tensor:
+    def decode(self, latent_states: torch.Tensor, current_raw_states: torch.Tensor | None = None) -> torch.Tensor:
         """Decode latent states to raw state space.
         
         Args:
             latent_states: Tensor of shape [..., latent_dim].
+            current_raw_states: Current raw state tensor, required when residual_decoder=True.
+                In residual mode: output = current_raw_states + Decoder(concat(z, current_raw_states)).
             
         Returns:
             Raw states of shape [..., state_dim] if latent_mode,
             otherwise returns latent_states unchanged.
         """
         if self.latent_mode and self.decoder is not None:
-            return self.decoder(latent_states)
+            return self.decoder(latent_states, current_state=current_raw_states)
         return latent_states
 
     @torch.no_grad()
@@ -344,7 +352,7 @@ class SystemDynamicsEnsemble(nn.Module):
         if model_ids is None:
             if self.latent_mode:
                 output_latent_means = state_means.mean(dim=0)
-                output_state_means = self.decode(output_latent_means)
+                output_state_means = self.decode(output_latent_means, current_raw_states=x_state_batch[:, -1])
             else:
                 output_state_means = state_means.mean(dim=0)
             output_extensions = extensions.mean(dim=0) if extensions is not None else None
@@ -354,7 +362,7 @@ class SystemDynamicsEnsemble(nn.Module):
             gather_dim = self.latent_dim if self.latent_mode else self.state_dim
             gathered = torch.gather(state_means, 0, model_ids.repeat(1, 1, gather_dim)).squeeze(0)
             if self.latent_mode:
-                output_state_means = self.decode(gathered)
+                output_state_means = self.decode(gathered, current_raw_states=x_state_batch[:, -1])
             else:
                 output_state_means = gathered
             output_extensions = torch.gather(extensions, 0, model_ids.repeat(1, 1, self.extension_dim)).squeeze(0) if extensions is not None else None
@@ -541,7 +549,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 consistency_loss = torch.sum(torch.square(latent_pred - latent_target), dim=1).mean(dim=0)
                 
                 # Reconstruction loss: decode predicted latent, compare to raw target
-                raw_pred = self.decoder(latent_pred)
+                raw_pred = self.decoder(latent_pred, current_state=state_batch[:, self.history_horizon + i - 1])
                 reconstruction_loss = torch.sum(torch.square(raw_pred - raw_target), dim=1).mean(dim=0)
                 
                 # Bidirectional encoder consistency loss (TD-MPC2 style, optional)
