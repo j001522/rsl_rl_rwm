@@ -296,7 +296,7 @@ class MBPOPPO(PPO):
         self.system_dynamics.reset()
         with torch.inference_mode():
             for i in range(self.system_dynamics.history_horizon, self.system_dynamics_len_eval_trajectory):
-                if self.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and i > self.system_dynamics.history_horizon:
+                if self.system_dynamics.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and i > self.system_dynamics.history_horizon:
                     state_input = state_traj_pred[:, i - 1:i]
                     action_input = action_traj_pred[:, i - 1:i]
                 else:

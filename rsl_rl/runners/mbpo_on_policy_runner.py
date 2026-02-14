@@ -187,7 +187,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             for i in range(self.num_imagination_steps):
                 if i % self.imagination_cfg["command_resample_interval"] == 0:
                     self.env.unwrapped.sample_imagination_command()
-                if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
+                if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and i > 0:
                     state_history = state_history[:, -1:]
                     action_history = action_history[:, -1:]
                 imagination_obs = self.env.unwrapped.get_imagination_observation(state_history, action_history)

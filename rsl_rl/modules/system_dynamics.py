@@ -4,6 +4,7 @@ import torch.nn as nn
 from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPStateHeadWithPrior, MLPAuxiliaryHead
 from rsl_rl.modules.architectures.mlp import LatentDynamicsHead
 from rsl_rl.modules.architectures.encoder_decoder import StateEncoder, StateDecoder
+from rsl_rl.modules.architectures.xlstm_base import xLSTMBase, XLSTM_AVAILABLE
 
 class SystemDynamicsEnsemble(nn.Module):
     """
@@ -228,6 +229,19 @@ class SystemDynamicsEnsemble(nn.Module):
             self.base_output_dim = self.architecture_config["rnn_hidden_size"]
             self.prediction_type = "single"
             return RNNBase(
+                input_dim=input_dim,
+                device=self.device,
+                architecture_config=self.architecture_config
+            )
+        elif self.architecture_config["type"] == "xlstm":
+            if not XLSTM_AVAILABLE:
+                raise ImportError(
+                    "xlstm library not found. Install with: pip install xlstm"
+                )
+            input_dim = base_state_dim + self.action_dim
+            self.base_output_dim = self.architecture_config.get("xlstm_embedding_dim", 256)
+            self.prediction_type = "single"
+            return xLSTMBase(
                 input_dim=input_dim,
                 device=self.device,
                 architecture_config=self.architecture_config
@@ -528,7 +542,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 latent_target = all_latent_targets[:, self.history_horizon + i]
                 raw_target = state_batch[:, self.history_horizon + i]
                 
-                if self.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
+                if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and i > 0:
                     x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
                 else:
                     x_action_batch = action_batch[:, i + 1:self.history_horizon + i + 1]
@@ -573,7 +587,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 kl_losses.append(kl_loss.unsqueeze(0))
                 
                 # Autoregressive: use predicted latent as next input
-                if self.architecture_config["type"] in ["rnn", "rssm"]:
+                if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"]:
                     x_latent_batch = latent_pred.unsqueeze(1).detach()
                 else:
                     x_latent_batch = torch.cat(
@@ -589,7 +603,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 else:
                     raise ValueError("Invalid state prediction type.")
                 
-                if self.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
+                if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and i > 0:
                     x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
                     if self.prediction_type == "sequence":
                         state_target = state_target[:, [-1]]
@@ -613,7 +627,7 @@ class SystemDynamicsEnsemble(nn.Module):
                     state_mean_pred = state_mean_pred[:, -1]
                     state_std_pred = state_std_pred[:, -1]
                 
-                if self.architecture_config["type"] in ["rnn", "rssm"]:
+                if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"]:
                     x_state_batch = (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1)
                 else:
                     x_state_batch = torch.cat(
@@ -651,7 +665,7 @@ class SystemDynamicsEnsemble(nn.Module):
             contact_target = contact_batch[:, self.history_horizon + i] if contact_batch is not None else None
             termination_target = termination_batch[:, self.history_horizon + i] if termination_batch is not None else None
             
-            if self.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
+            if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and i > 0:
                 x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
             else:
                 x_action_batch = action_batch[:, i + 1:self.history_horizon + i + 1]
@@ -666,7 +680,7 @@ class SystemDynamicsEnsemble(nn.Module):
             contact_losses.append(contact_loss.unsqueeze(0))
             termination_losses.append(termination_loss.unsqueeze(0))
             
-            if self.architecture_config["type"] in ["rnn", "rssm"]:
+            if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"]:
                 x_state_batch = state_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
             else:
                 x_state_batch = torch.cat([x_state_batch[:, 1:].clone(), state_batch[:, self.history_horizon + i:self.history_horizon + i + 1]], dim=1)
