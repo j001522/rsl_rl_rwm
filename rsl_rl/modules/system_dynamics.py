@@ -849,7 +849,7 @@ class SystemDynamicsEnsemble(nn.Module):
                 consistency_loss = torch.sum(torch.square(latent_pred - latent_target), dim=1).mean(dim=0)
                 
                 # Reconstruction loss
-                raw_pred = self.decoder(latent_pred, current_state=state_batch[:, self.history_horizon + i - 1])
+                raw_pred = self.decoder(latent_pred)
                 reconstruction_loss = torch.sum(torch.square(raw_pred - raw_target), dim=1).mean(dim=0)
                 
                 # Encoder consistency loss
