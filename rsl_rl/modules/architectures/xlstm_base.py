@@ -16,6 +16,22 @@ Key differences from RNNBase:
 - mLSTM blocks are the default (no CUDA compilation needed)
 """
 
+import sys
+import os
+from unittest.mock import MagicMock
+
+# Patch sLSTM imports to be lazy (allows mLSTM without CUDA_HOME)
+# This prevents the sLSTM CUDA initialization from running when only mLSTM is used
+# Only mock the cuda_init module that triggers the CUDA_HOME error
+if 'xlstm.blocks.slstm.src.cuda_init' not in sys.modules:
+    mock_cuda_init = MagicMock()
+    mock_cuda_init.load = lambda: None
+    sys.modules['xlstm.blocks.slstm.src.cuda_init'] = mock_cuda_init
+
+# Set a dummy CUDA_HOME to prevent the error, but only if not already set
+if 'CUDA_HOME' not in os.environ:
+    os.environ['CUDA_HOME'] = '/tmp'
+
 import torch
 import torch.nn as nn
 
@@ -30,7 +46,7 @@ try:
         FeedForwardConfig,
     )
     XLSTM_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     XLSTM_AVAILABLE = False
 
 
@@ -178,10 +194,14 @@ class xLSTMBase(nn.Module):
             out = self.xlstm_stack(x)  # [B, S, embedding_dim]
             
             # Initialize step state by running through step() mode
-            # This is needed so that subsequent step() calls have correct state
-            self._state = None
-            for t in range(seq_len):
-                _, self._state = self.xlstm_stack.step(x[:, t:t+1, :], self._state)
+            # This is needed so that subsequent step() calls have correct state.
+            # We use no_grad() here because this loop only initializes recurrent
+            # state for future autoregressive steps — gradients flow through the
+            # parallel forward() output above, not through this state init loop.
+            with torch.no_grad():
+                self._state = None
+                for t in range(seq_len):
+                    _, self._state = self.xlstm_stack.step(x[:, t:t+1, :], self._state)
             
             return out[:, -1]  # [B, embedding_dim]
     

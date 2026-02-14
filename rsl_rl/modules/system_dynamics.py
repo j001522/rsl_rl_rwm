@@ -446,6 +446,40 @@ class SystemDynamicsEnsemble(nn.Module):
         
         return output_latent_means, epistemic_uncertainty
 
+    def _save_backbone_state(self, base):
+        """Save a backbone's internal recurrent state for later restoration.
+        
+        Works for RNNBase (GRU/LSTM hidden_states) and xLSTMBase (_state).
+        Returns a deep copy so restoring doesn't share tensors with the original.
+        """
+        if isinstance(base, RNNBase):
+            if base.memory.hidden_states is not None:
+                return base.memory.hidden_states.clone()
+            return None
+        elif isinstance(base, xLSTMBase):
+            if base._state is not None:
+                return copy.deepcopy(base._state)
+            return None
+        # MLPBase and others have no recurrent state
+        return None
+    
+    def _restore_backbone_state(self, base, saved_state):
+        """Restore a backbone's internal recurrent state from a saved copy.
+        
+        Works for RNNBase (GRU/LSTM hidden_states) and xLSTMBase (_state).
+        Clones the saved state so the saved copy can be reused for other heads.
+        """
+        if isinstance(base, RNNBase):
+            if saved_state is not None:
+                base.memory.hidden_states = saved_state.clone()
+            else:
+                base.memory.hidden_states = None
+        elif isinstance(base, xLSTMBase):
+            if saved_state is not None:
+                base._state = copy.deepcopy(saved_state)
+            else:
+                base._state = None
+
     def compute_loss(self, state_batch, action_batch, extension_batch, contact_batch, termination_batch, bootstrap=False):
         state_losses = []
         sequence_losses = []
@@ -458,40 +492,158 @@ class SystemDynamicsEnsemble(nn.Module):
         contact_losses = []
         termination_losses = []
         
-        for i in range(self.ensemble_size):
-            if bootstrap:
-                ids = torch.randint(0, state_batch.shape[0], (state_batch.shape[0],), device=self.device)
+        is_recurrent = self.architecture_config["type"] in ["rnn", "rssm", "xlstm"]
+        can_cache = not bootstrap and is_recurrent and self.ensemble_size > 1
+        
+        if can_cache:
+            # === Optimized path: cache backbone history pass (bootstrap=False) ===
+            # When bootstrap=False all ensemble members get identical data, so the
+            # shared backbone's initial history forward pass is redundant across heads.
+            # We compute it once, cache the output and recurrent state, then restore
+            # for each head's forecast loop.
+            
+            s_batch = state_batch
+            a_batch = action_batch
+            
+            # --- Pre-compute history pass for state_base ---
+            forecast_horizon = s_batch.shape[1] - self.history_horizon
+            
+            if self.latent_mode:
+                # Encode targets with EMA encoder (no grad)
+                with torch.no_grad():
+                    all_latent_targets = self.target_encoder(s_batch)
+                # Encode history with online encoder (with grad for encoder training)
+                x_input_history = self.encoder(s_batch[:, :self.history_horizon])
             else:
-                ids = torch.arange(0, state_batch.shape[0], device=self.device)
+                x_input_history = s_batch[:, :self.history_horizon]
             
-            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss = self.compute_state_loss(
-                self.state_heads[i], state_batch[ids], action_batch[ids]
-            )
+            # First action batch for the history window (forecast step i=0)
+            x_action_history = a_batch[:, 1:self.history_horizon + 1]
             
-            if self.auxiliary_heads is not None:
-                extension_loss, contact_loss, termination_loss = self.compute_auxiliary_loss(
-                    self.auxiliary_heads[i],
-                    state_batch[ids],
-                    action_batch[ids],
-                    extension_batch[ids] if extension_batch is not None else None,
-                    contact_batch[ids] if contact_batch is not None else None,
-                    termination_batch[ids] if termination_batch is not None else None
+            # Run state_base on the history — this is the expensive call
+            self.state_base.reset()
+            history_base_output = self.state_base.forward(x_input_history, x_action_history)
+            # Save recurrent state after history processing
+            cached_state_base_state = self._save_backbone_state(self.state_base)
+            
+            # --- Forecast loop per state head (diverges due to different head weights) ---
+            for i in range(self.ensemble_size):
+                # Restore backbone state to post-history checkpoint
+                self._restore_backbone_state(self.state_base, cached_state_base_state)
+                
+                state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss = self._compute_state_loss_with_cache(
+                    self.state_heads[i], s_batch, a_batch,
+                    history_base_output,
+                    x_input_history,
+                    all_latent_targets if self.latent_mode else None,
                 )
-            else:
-                extension_loss = torch.tensor(0.0, device=self.device)
-                contact_loss = torch.tensor(0.0, device=self.device)
-                termination_loss = torch.tensor(0.0, device=self.device)
+                
+                state_losses.append(state_loss.unsqueeze(0))
+                sequence_losses.append(sequence_loss.unsqueeze(0))
+                bound_losses.append(bound_loss.unsqueeze(0))
+                kl_losses.append(kl_loss.unsqueeze(0))
+                consistency_losses.append(consistency_loss.unsqueeze(0))
+                reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
+                encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
             
-            state_losses.append(state_loss.unsqueeze(0))
-            sequence_losses.append(sequence_loss.unsqueeze(0))
-            bound_losses.append(bound_loss.unsqueeze(0))
-            kl_losses.append(kl_loss.unsqueeze(0))
-            consistency_losses.append(consistency_loss.unsqueeze(0))
-            reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
-            encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
-            extension_losses.append(extension_loss.unsqueeze(0))
-            contact_losses.append(contact_loss.unsqueeze(0))
-            termination_losses.append(termination_loss.unsqueeze(0))
+            # --- Auxiliary: cache auxiliary_base forward pass, share across heads ---
+            # The auxiliary branch uses ground-truth states for autoregressive input,
+            # so all 5 auxiliary_base forward passes produce identical output when
+            # bootstrap=False. We compute the base forward loop once, cache the
+            # per-step base outputs, then run each head against those cached outputs.
+            if self.auxiliary_heads is not None:
+                self.auxiliary_base.reset()
+                e_batch = extension_batch if extension_batch is not None else None
+                c_batch = contact_batch if contact_batch is not None else None
+                t_batch = termination_batch if termination_batch is not None else None
+                
+                # Pre-compute auxiliary_base outputs for all forecast steps
+                aux_forecast_horizon = s_batch.shape[1] - self.history_horizon
+                aux_base_outputs = []
+                aux_x_state_batches = []  # Track the x_state_batch at each step for head input
+                x_aux_state = s_batch[:, :self.history_horizon]
+                
+                for fi in range(aux_forecast_horizon):
+                    if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"] and fi > 0:
+                        x_aux_action = a_batch[:, self.history_horizon + fi:self.history_horizon + fi + 1]
+                    else:
+                        x_aux_action = a_batch[:, fi + 1:self.history_horizon + fi + 1]
+                    
+                    aux_base_out = self.auxiliary_base.forward(x_aux_state, x_aux_action)
+                    aux_base_outputs.append(aux_base_out)
+                    aux_x_state_batches.append(x_aux_state)
+                    
+                    # Autoregressive with ground-truth state
+                    if self.architecture_config["type"] in ["rnn", "rssm", "xlstm"]:
+                        x_aux_state = s_batch[:, self.history_horizon + fi:self.history_horizon + fi + 1]
+                    else:
+                        x_aux_state = torch.cat([x_aux_state[:, 1:].clone(), s_batch[:, self.history_horizon + fi:self.history_horizon + fi + 1]], dim=1)
+                
+                # Now run each auxiliary head using the cached base outputs
+                for aux_head in self.auxiliary_heads:
+                    aux_ext_losses = []
+                    aux_con_losses = []
+                    aux_ter_losses = []
+                    for fi in range(aux_forecast_horizon):
+                        ext_target = e_batch[:, self.history_horizon + fi] if e_batch is not None else None
+                        con_target = c_batch[:, self.history_horizon + fi] if c_batch is not None else None
+                        ter_target = t_batch[:, self.history_horizon + fi] if t_batch is not None else None
+                        
+                        ext_pred, con_pred, ter_pred = aux_head.forward(aux_base_outputs[fi], aux_x_state_batches[fi])
+                        
+                        ext_l = self.compute_extension_loss(ext_pred, ext_target) if self.extension_dim > 0 else torch.tensor(0.0, device=self.device)
+                        con_l = self.compute_contact_loss(con_pred, con_target) if self.contact_dim > 0 else torch.tensor(0.0, device=self.device)
+                        ter_l = self.compute_termination_loss(ter_pred, ter_target) if self.termination_dim > 0 else torch.tensor(0.0, device=self.device)
+                        
+                        aux_ext_losses.append(ext_l.unsqueeze(0))
+                        aux_con_losses.append(con_l.unsqueeze(0))
+                        aux_ter_losses.append(ter_l.unsqueeze(0))
+                    
+                    extension_losses.append(torch.mean(torch.cat(aux_ext_losses, dim=0), dim=0).unsqueeze(0))
+                    contact_losses.append(torch.mean(torch.cat(aux_con_losses, dim=0), dim=0).unsqueeze(0))
+                    termination_losses.append(torch.mean(torch.cat(aux_ter_losses, dim=0), dim=0).unsqueeze(0))
+            else:
+                for _ in range(self.ensemble_size):
+                    extension_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                    contact_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                    termination_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+        
+        else:
+            # === Original path: per-head computation (bootstrap=True or non-recurrent) ===
+            for i in range(self.ensemble_size):
+                if bootstrap:
+                    ids = torch.randint(0, state_batch.shape[0], (state_batch.shape[0],), device=self.device)
+                else:
+                    ids = torch.arange(0, state_batch.shape[0], device=self.device)
+                
+                state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss = self.compute_state_loss(
+                    self.state_heads[i], state_batch[ids], action_batch[ids]
+                )
+                
+                if self.auxiliary_heads is not None:
+                    extension_loss, contact_loss, termination_loss = self.compute_auxiliary_loss(
+                        self.auxiliary_heads[i],
+                        state_batch[ids],
+                        action_batch[ids],
+                        extension_batch[ids] if extension_batch is not None else None,
+                        contact_batch[ids] if contact_batch is not None else None,
+                        termination_batch[ids] if termination_batch is not None else None
+                    )
+                else:
+                    extension_loss = torch.tensor(0.0, device=self.device)
+                    contact_loss = torch.tensor(0.0, device=self.device)
+                    termination_loss = torch.tensor(0.0, device=self.device)
+                
+                state_losses.append(state_loss.unsqueeze(0))
+                sequence_losses.append(sequence_loss.unsqueeze(0))
+                bound_losses.append(bound_loss.unsqueeze(0))
+                kl_losses.append(kl_loss.unsqueeze(0))
+                consistency_losses.append(consistency_loss.unsqueeze(0))
+                reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
+                encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
+                extension_losses.append(extension_loss.unsqueeze(0))
+                contact_losses.append(contact_loss.unsqueeze(0))
+                termination_losses.append(termination_loss.unsqueeze(0))
         
         state_loss = torch.mean(torch.cat(state_losses, dim=0), dim=0)
         sequence_loss = torch.mean(torch.cat(sequence_losses, dim=0), dim=0)
@@ -637,6 +789,136 @@ class SystemDynamicsEnsemble(nn.Module):
                         ],
                         dim=1
                     )
+        
+        state_loss = torch.mean(torch.cat(state_losses, dim=0), dim=0)
+        sequence_loss = torch.mean(torch.cat(sequence_losses, dim=0), dim=0)
+        bound_loss = torch.mean(torch.cat(bound_losses, dim=0), dim=0)
+        kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
+        consistency_loss = torch.mean(torch.cat(consistency_losses, dim=0), dim=0)
+        reconstruction_loss = torch.mean(torch.cat(reconstruction_losses, dim=0), dim=0)
+        encoder_consistency_loss = torch.mean(torch.cat(encoder_consistency_losses, dim=0), dim=0)
+        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss
+
+    def _compute_state_loss_with_cache(self, head, state_batch, action_batch,
+                                       history_base_output, x_input_history,
+                                       all_latent_targets):
+        """Compute state loss using a precomputed history base output.
+        
+        This is the optimized path for bootstrap=False with recurrent backbones.
+        The initial history pass through state_base has already been done once and
+        cached. The backbone's recurrent state has been restored to the post-history
+        checkpoint. This method only runs the forecast loop (per-head divergent part).
+        
+        Args:
+            head: The ensemble state head to use.
+            state_batch: Full state batch [B, history+forecast, state_dim].
+            action_batch: Full action batch [B, history+forecast, action_dim].
+            history_base_output: Precomputed state_base output for history [B, base_dim].
+            x_input_history: Encoded history input (latent or raw) [B, history, dim].
+            all_latent_targets: EMA target encoder output (latent mode) or None.
+        """
+        forecast_horizon = state_batch.shape[1] - self.history_horizon
+        state_losses = []
+        sequence_losses = []
+        bound_losses = []
+        kl_losses = []
+        consistency_losses = []
+        reconstruction_losses = []
+        encoder_consistency_losses = []
+        
+        if self.latent_mode:
+            x_latent_batch = x_input_history
+        else:
+            x_state_batch = x_input_history
+        
+        for i in range(forecast_horizon):
+            if self.latent_mode:
+                latent_target = all_latent_targets[:, self.history_horizon + i]
+                raw_target = state_batch[:, self.history_horizon + i]
+                
+                if i == 0:
+                    # Use the precomputed history base output for the first step
+                    base_output = history_base_output
+                else:
+                    x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
+                    base_output = self.state_base.forward(x_latent_batch, x_action_batch)
+                
+                latent_pred, _ = head.forward(base_output, x_latent_batch)
+                
+                # Consistency loss
+                consistency_loss = torch.sum(torch.square(latent_pred - latent_target), dim=1).mean(dim=0)
+                
+                # Reconstruction loss
+                raw_pred = self.decoder(latent_pred, current_state=state_batch[:, self.history_horizon + i - 1])
+                reconstruction_loss = torch.sum(torch.square(raw_pred - raw_target), dim=1).mean(dim=0)
+                
+                # Encoder consistency loss
+                if self.encoder_consistency_coef > 0:
+                    online_next_latent = self.encoder(state_batch[:, self.history_horizon + i])
+                    encoder_consistency_loss = torch.sum(
+                        torch.square(online_next_latent - latent_pred.detach()), dim=1
+                    ).mean(dim=0)
+                else:
+                    encoder_consistency_loss = torch.tensor(0.0, device=self.device)
+                
+                state_loss = (
+                    self.consistency_coef * consistency_loss
+                    + self.reconstruction_coef * reconstruction_loss
+                    + self.encoder_consistency_coef * encoder_consistency_loss
+                )
+                sequence_loss = torch.tensor(0.0, device=self.device)
+                bound_loss = torch.tensor(0.0, device=self.device)
+                kl_loss = torch.tensor(0.0, device=self.device)
+                
+                consistency_losses.append(consistency_loss.unsqueeze(0))
+                reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
+                encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
+                state_losses.append(state_loss.unsqueeze(0))
+                sequence_losses.append(sequence_loss.unsqueeze(0))
+                bound_losses.append(bound_loss.unsqueeze(0))
+                kl_losses.append(kl_loss.unsqueeze(0))
+                
+                # Autoregressive: use predicted latent as next input (single step)
+                x_latent_batch = latent_pred.unsqueeze(1).detach()
+            else:
+                # Raw state mode
+                if self.prediction_type == "single":
+                    state_target = state_batch[:, self.history_horizon + i]
+                elif self.prediction_type == "sequence":
+                    state_target = state_batch[:, i + 1:self.history_horizon + i + 1]
+                else:
+                    raise ValueError("Invalid state prediction type.")
+                
+                if i == 0:
+                    # Use the precomputed history base output for the first step
+                    base_output = history_base_output
+                    if self.prediction_type == "sequence":
+                        pass  # state_target already set above
+                else:
+                    x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
+                    if self.prediction_type == "sequence":
+                        state_target = state_target[:, [-1]]
+                    base_output = self.state_base.forward(x_state_batch, x_action_batch)
+                
+                state_mean_pred, state_std_pred = head.forward(base_output, x_state_batch)
+                state_loss, sequence_loss = self.compute_regression_loss(state_mean_pred, state_std_pred, state_target)
+                bound_loss = self.compute_bound_loss(head) if head.output_std else torch.tensor(0.0, device=self.device)
+                kl_loss = torch.tensor(0.0, device=self.device)
+                
+                consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                reconstruction_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                encoder_consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                state_losses.append(state_loss.unsqueeze(0))
+                sequence_losses.append(sequence_loss.unsqueeze(0))
+                bound_losses.append(bound_loss.unsqueeze(0))
+                kl_losses.append(kl_loss.unsqueeze(0))
+                
+                if self.prediction_type == "sequence":
+                    state_mean_pred = state_mean_pred[:, -1]
+                    state_std_pred = state_std_pred[:, -1]
+                
+                # Autoregressive: single step
+                x_state_batch = (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1)
         
         state_loss = torch.mean(torch.cat(state_losses, dim=0), dim=0)
         sequence_loss = torch.mean(torch.cat(sequence_losses, dim=0), dim=0)
