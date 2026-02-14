@@ -450,15 +450,25 @@ class SystemDynamicsEnsemble(nn.Module):
         """Save a backbone's internal recurrent state for later restoration.
         
         Works for RNNBase (GRU/LSTM hidden_states) and xLSTMBase (_state).
-        Returns a deep copy so restoring doesn't share tensors with the original.
+        Returns a detached copy so restoring doesn't share tensors or computational graph.
         """
         if isinstance(base, RNNBase):
             if base.memory.hidden_states is not None:
-                return base.memory.hidden_states.clone()
+                return base.memory.hidden_states.clone().detach()
             return None
         elif isinstance(base, xLSTMBase):
             if base._state is not None:
-                return copy.deepcopy(base._state)
+                # Deep copy and detach all tensors to avoid in-place operation issues
+                import copy
+                state_copy = copy.deepcopy(base._state)
+                def detach_dict(d):
+                    for k, v in d.items():
+                        if isinstance(v, torch.Tensor):
+                            d[k] = v.detach().clone()
+                        elif isinstance(v, dict):
+                            detach_dict(v)
+                detach_dict(state_copy)
+                return state_copy
             return None
         # MLPBase and others have no recurrent state
         return None
