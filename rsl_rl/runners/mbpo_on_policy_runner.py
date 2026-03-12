@@ -181,8 +181,9 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         cur_reward_sum = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
         epistemic_uncertainty = torch.zeros(self.num_imagination_steps, device=self.device)
-        state_history, action_history = self.alg.prepare_imagination()
+        state_history, action_history, latent_state = self.alg.prepare_imagination()
         self.env.unwrapped.prepare_imagination()
+        use_latent_native = latent_state is not None
         with torch.inference_mode():
             for i in range(self.num_imagination_steps):
                 if i % self.imagination_cfg["command_resample_interval"] == 0:
@@ -190,9 +191,16 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                 if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
                     state_history = state_history[:, -1:]
                     action_history = action_history[:, -1:]
+                    if use_latent_native:
+                        latent_state = latent_state[:, -1:]
                 imagination_obs = self.env.unwrapped.get_imagination_observation(state_history, action_history)
                 imagination_actions = self.alg.act(imagination_obs)
-                imagination_obs, imagination_rewards, imagination_dones, imagination_extras, state_history, action_history, uncertainty = self.env.unwrapped.imagination_step(imagination_actions, state_history, action_history)
+                if use_latent_native:
+                    imagination_obs, imagination_rewards, imagination_dones, imagination_extras, state_history, action_history, uncertainty, latent_state = \
+                        self.env.unwrapped.latent_imagination_step(imagination_actions, state_history, action_history, latent_state)
+                else:
+                    imagination_obs, imagination_rewards, imagination_dones, imagination_extras, state_history, action_history, uncertainty = \
+                        self.env.unwrapped.imagination_step(imagination_actions, state_history, action_history)
                 self.alg.process_env_step(imagination_obs, imagination_rewards, imagination_dones, imagination_extras, imagination=True)
                 epistemic_uncertainty[i] = uncertainty.mean(dim=0)
                 

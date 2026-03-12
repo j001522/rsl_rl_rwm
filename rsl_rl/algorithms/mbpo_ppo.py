@@ -66,6 +66,8 @@ class MBPOPPO(PPO):
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Latent-native imagination
+        latent_native_imagination: bool = False,
     ):
         super().__init__(
             policy=policy,
@@ -112,6 +114,7 @@ class MBPOPPO(PPO):
 
         self.state_normalizer = state_normalizer
         self.action_normalizer = action_normalizer
+        self.latent_native_imagination = latent_native_imagination
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape, imagination=False):
         if imagination:
@@ -318,7 +321,14 @@ class MBPOPPO(PPO):
     def prepare_imagination(self):
         imagination_generator = self.system_replay_buffer.mini_batch_generator(self.system_dynamics.history_horizon, 1, self.imagination_storage.num_envs)
         imagination_state_history, imagination_action_history = next(imagination_generator)[:2]
-        return imagination_state_history, imagination_action_history
+        
+        if self.latent_native_imagination and self.system_dynamics.latent_mode:
+            # Encode the initial state history once; this latent state will be
+            # carried through the imagination loop without re-encoding
+            latent_state = self.system_dynamics.encode(imagination_state_history)
+            return imagination_state_history, imagination_action_history, latent_state
+        
+        return imagination_state_history, imagination_action_history, None
 
     def mini_batch_generator_combined(self, real_storage, imagination_storage):
         real_generator = real_storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
