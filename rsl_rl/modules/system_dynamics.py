@@ -515,6 +515,94 @@ class SystemDynamicsEnsemble(nn.Module):
         
         return output_latent_means, epistemic_uncertainty
 
+    def forward_latent_imagination(self, x_latent_batch, x_action_batch, x_decoded_state_batch, model_ids=None):
+        """Forward pass for latent-native imagination rollouts.
+        
+        Performs dynamics prediction in latent space (no re-encoding), then decodes
+        the result for reward computation and runs auxiliary heads on decoded states.
+        
+        This avoids the encode(decode(z)) != z compounding drift that occurs when
+        the standard forward() method re-encodes decoded predictions at each step.
+        
+        Only available in latent mode. Raises error if called in raw mode.
+        
+        Args:
+            x_latent_batch: Latent state history [batch, horizon, latent_dim].
+            x_action_batch: Action history [batch, horizon, action_dim].
+            x_decoded_state_batch: Decoded (raw) state history [batch, horizon, state_dim].
+                Used by auxiliary heads (contacts, terminations, extensions) which operate
+                on raw states.
+            model_ids: Optional ensemble member selection [1, batch, 1].
+        
+        Returns:
+            Tuple of (output_state_means, aleatoric_uncertainty, epistemic_uncertainty,
+                       output_extensions, output_contacts, output_terminations, output_latent_means)
+            where output_state_means are decoded raw states, and output_latent_means are
+            the latent predictions to carry forward to the next step.
+        """
+        assert self.latent_mode, "forward_latent_imagination() can only be called in latent mode"
+        
+        # --- Latent dynamics (state heads) ---
+        latent_means = []
+        state_base_output = self.state_base(x_latent_batch, x_action_batch)
+        
+        for head in self.state_heads:
+            latent_mean, _ = head(state_base_output, x_latent_batch)
+            if self.prediction_type == "sequence":
+                latent_mean = latent_mean[:, -1]
+            latent_means.append(latent_mean.unsqueeze(0))
+        
+        latent_means = torch.cat(latent_means, dim=0)
+        
+        # Select or average latent predictions
+        if model_ids is None:
+            output_latent_means = latent_means.mean(dim=0)
+        else:
+            output_latent_means = torch.gather(
+                latent_means, 0, model_ids.repeat(1, 1, self.latent_dim)
+            ).squeeze(0)
+        
+        # Decode to raw state space (for reward computation + actor observations)
+        output_state_means = self.decode(output_latent_means)
+        
+        # --- Auxiliary heads (always use raw/decoded states) ---
+        extensions, contacts, terminations = [], [], []
+        auxiliary_base_output = self.auxiliary_base(x_decoded_state_batch, x_action_batch)
+        for head in self.auxiliary_heads:
+            extension, contact, termination = head(auxiliary_base_output, x_decoded_state_batch)
+            if self.prediction_type == "sequence":
+                extension = extension[:, -1] if extension is not None else None
+                contact = contact[:, -1] if contact is not None else None
+                termination = termination[:, -1] if termination is not None else None
+            extensions.append(extension.unsqueeze(0) if extension is not None else None)
+            contacts.append(contact.unsqueeze(0) if contact is not None else None)
+            terminations.append(termination.unsqueeze(0) if termination is not None else None)
+        
+        extensions = torch.cat(extensions, dim=0) if self.extension_dim > 0 else None
+        contacts = torch.cat(contacts, dim=0) if self.contact_dim > 0 else None
+        terminations = torch.cat(terminations, dim=0) if self.termination_dim > 0 else None
+        
+        if model_ids is None:
+            output_extensions = extensions.mean(dim=0) if extensions is not None else None
+            output_contacts = contacts.mean(dim=0) if contacts is not None else None
+            output_terminations = terminations.mean(dim=0) if terminations is not None else None
+        else:
+            output_extensions = torch.gather(extensions, 0, model_ids.repeat(1, 1, self.extension_dim)).squeeze(0) if extensions is not None else None
+            output_contacts = torch.gather(contacts, 0, model_ids.repeat(1, 1, self.contact_dim)).squeeze(0) if contacts is not None else None
+            output_terminations = torch.gather(terminations, 0, model_ids.repeat(1, 1, self.termination_dim)).squeeze(0) if terminations is not None else None
+        
+        # --- Uncertainty (epistemic only, in latent space) ---
+        aleatoric_uncertainty = torch.zeros(output_state_means.shape[0], device=self.device)
+        if self.ensemble_size > 1:
+            if self.uncertainty_metric == "variance":
+                epistemic_uncertainty = latent_means.var(dim=0).sum(dim=1)
+            else:
+                epistemic_uncertainty = latent_means.std(dim=0).sum(dim=1)
+        else:
+            epistemic_uncertainty = torch.zeros(output_state_means.shape[0], device=self.device)
+        
+        return output_state_means, aleatoric_uncertainty, epistemic_uncertainty, output_extensions, output_contacts, output_terminations, output_latent_means
+
     def compute_loss(self, state_batch, action_batch, extension_batch, contact_batch, termination_batch, reward_batch=None, done_batch=None, bootstrap=False):
         state_losses = []
         sequence_losses = []
