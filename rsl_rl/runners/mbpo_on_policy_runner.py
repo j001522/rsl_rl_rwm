@@ -91,7 +91,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                         self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
-                    self.alg.fill_history_buffer(obs)
+                    self.alg.fill_history_buffer(obs, rewards=rewards, dones=dones)
                     # book keeping
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -129,7 +129,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                 # compute returns
                 self.alg.compute_returns(obs)
             
-            mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss = self.alg.update_system_dynamics()
+            mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss, mean_system_reward_loss, mean_system_value_loss = self.alg.update_system_dynamics()
             # update policy
             if it >= start_iter + self.cfg["system_dynamics_warmup_iterations"]:
                 if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
@@ -252,6 +252,11 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             self.writer.add_scalar("System Dynamics/contact_loss", locs["mean_system_contact_loss"], locs["it"])
         if self.system_termination_dim > 0:
             self.writer.add_scalar("System Dynamics/termination_loss", locs["mean_system_termination_loss"], locs["it"])
+        # Phase 3: reward and value losses (only log when enabled)
+        if self.alg.system_dynamics.reward_head_enabled:
+            self.writer.add_scalar("System Dynamics/reward_loss", locs["mean_system_reward_loss"], locs["it"])
+        if self.alg.system_dynamics.value_head_enabled:
+            self.writer.add_scalar("System Dynamics/value_loss", locs["mean_system_value_loss"], locs["it"])
         self.writer.add_scalar("System Dynamics/learning_rate", self.alg.system_dynamics_learning_rate, locs["it"])
         
         if locs["it"] % self.save_interval == 0:

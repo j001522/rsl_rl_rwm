@@ -4,6 +4,8 @@ import torch.nn as nn
 from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPStateHeadWithPrior, MLPAuxiliaryHead
 from rsl_rl.modules.architectures.mlp import LatentDynamicsHead
 from rsl_rl.modules.architectures.encoder_decoder import StateEncoder, StateDecoder
+from rsl_rl.modules.architectures.reward_value_heads import RewardHead, ValueHeadEnsemble
+from rsl_rl.modules.architectures.latent_layers import symlog, symexp
 
 class SystemDynamicsEnsemble(nn.Module):
     """
@@ -54,6 +56,14 @@ class SystemDynamicsEnsemble(nn.Module):
         encoder_consistency_coef: Weight for bidirectional encoder consistency loss
             (default 0.0, disabled). When > 0, adds a loss term that trains the encoder
             to produce representations consistent with dynamics predictions (TD-MPC2 style).
+        reward_head_enabled: Whether to add a reward prediction head (Phase 3).
+        value_head_enabled: Whether to add a value prediction head ensemble (Phase 3).
+        value_ensemble_size: Number of value heads in the ensemble (default 5).
+        reward_hidden_dims: Hidden layer widths for reward head (default [256, 256]).
+        value_hidden_dims: Hidden layer widths for value heads (default [256, 256]).
+        reward_prior_scale: Scale for reward head randomized prior (default 0.1).
+        value_prior_scale: Scale for value head randomized priors (default 0.1).
+        value_gamma: Discount factor for TD targets (default 0.99).
     """
     
     def __init__(
@@ -84,6 +94,15 @@ class SystemDynamicsEnsemble(nn.Module):
         reconstruction_coef: float = 1.0,
         target_encoder_momentum: float = 0.99,
         encoder_consistency_coef: float = 0.0,
+        # Phase 3: Reward and Value head parameters
+        reward_head_enabled: bool = False,
+        value_head_enabled: bool = False,
+        value_ensemble_size: int = 5,
+        reward_hidden_dims: list = None,
+        value_hidden_dims: list = None,
+        reward_prior_scale: float = 0.1,
+        value_prior_scale: float = 0.1,
+        value_gamma: float = 0.99,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -113,6 +132,16 @@ class SystemDynamicsEnsemble(nn.Module):
         self.reconstruction_coef = reconstruction_coef
         self.target_encoder_momentum = target_encoder_momentum
         self.encoder_consistency_coef = encoder_consistency_coef
+        
+        # Phase 3: Reward and Value head config
+        self.reward_head_enabled = reward_head_enabled
+        self.value_head_enabled = value_head_enabled
+        self.value_ensemble_size = value_ensemble_size
+        self.reward_hidden_dims = reward_hidden_dims or [256, 256]
+        self.value_hidden_dims = value_hidden_dims or [256, 256]
+        self.reward_prior_scale = reward_prior_scale
+        self.value_prior_scale = value_prior_scale
+        self.value_gamma = value_gamma
         
         self._init_networks()
 
@@ -204,6 +233,35 @@ class SystemDynamicsEnsemble(nn.Module):
                 for param in head.parameters():
                     param.requires_grad = False
 
+        # --- Phase 3: Reward Head (latent mode only) ---
+        if self.reward_head_enabled and self.latent_mode:
+            self.reward_head = RewardHead(
+                latent_dim=self.latent_dim,
+                action_dim=self.action_dim,
+                hidden_dims=self.reward_hidden_dims,
+                prior_scale=self.reward_prior_scale,
+                device=self.device,
+            ).to(self.device)
+        else:
+            self.reward_head = None
+
+        # --- Phase 3: Value Head Ensemble + Target Value Heads (latent mode only) ---
+        if self.value_head_enabled and self.latent_mode:
+            self.value_heads = ValueHeadEnsemble(
+                n_heads=self.value_ensemble_size,
+                latent_dim=self.latent_dim,
+                hidden_dims=self.value_hidden_dims,
+                prior_scale=self.value_prior_scale,
+                device=self.device,
+            ).to(self.device)
+            # EMA target value heads (frozen copies for stable TD targets)
+            self.target_value_heads = copy.deepcopy(self.value_heads)
+            for param in self.target_value_heads.parameters():
+                param.requires_grad = False
+        else:
+            self.value_heads = None
+            self.target_value_heads = None
+
     def _create_base(self, use_latent_dim: bool = True):
         """Create backbone network.
         
@@ -280,6 +338,31 @@ class SystemDynamicsEnsemble(nn.Module):
             momentum = self.target_encoder_momentum
         for param_online, param_target in zip(self.encoder.parameters(), self.target_encoder.parameters()):
             param_target.data.mul_(momentum).add_(param_online.data, alpha=1.0 - momentum)
+
+    @torch.no_grad()
+    def update_targets(self, momentum: float | None = None):
+        """Update all EMA target networks: target encoder + target value heads.
+        
+        θ_target ← momentum * θ_target + (1 - momentum) * θ_online
+        
+        Replaces calling update_target_encoder() alone. Safe to call when
+        value heads are disabled (just updates target encoder).
+        
+        Args:
+            momentum: EMA momentum. If None, uses self.target_encoder_momentum.
+        """
+        if momentum is None:
+            momentum = self.target_encoder_momentum
+        
+        # Update target encoder
+        self.update_target_encoder(momentum)
+        
+        # Update target value heads
+        if self.target_value_heads is not None and self.value_heads is not None:
+            for param_online, param_target in zip(
+                self.value_heads.parameters(), self.target_value_heads.parameters()
+            ):
+                param_target.data.mul_(momentum).add_(param_online.data, alpha=1.0 - momentum)
 
     def forward(self, x_state_batch, x_action_batch, model_ids=None):
         """Forward pass through the ensemble.
@@ -432,7 +515,7 @@ class SystemDynamicsEnsemble(nn.Module):
         
         return output_latent_means, epistemic_uncertainty
 
-    def compute_loss(self, state_batch, action_batch, extension_batch, contact_batch, termination_batch, bootstrap=False):
+    def compute_loss(self, state_batch, action_batch, extension_batch, contact_batch, termination_batch, reward_batch=None, done_batch=None, bootstrap=False):
         state_losses = []
         sequence_losses = []
         bound_losses = []
@@ -440,6 +523,8 @@ class SystemDynamicsEnsemble(nn.Module):
         consistency_losses = []
         reconstruction_losses = []
         encoder_consistency_losses = []
+        reward_losses = []
+        value_losses = []
         extension_losses = []
         contact_losses = []
         termination_losses = []
@@ -450,8 +535,11 @@ class SystemDynamicsEnsemble(nn.Module):
             else:
                 ids = torch.arange(0, state_batch.shape[0], device=self.device)
             
-            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss = self.compute_state_loss(
-                self.state_heads[i], state_batch[ids], action_batch[ids]
+            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, reward_loss, value_loss = self.compute_state_loss(
+                self.state_heads[i], state_batch[ids], action_batch[ids],
+                reward_batch=reward_batch[ids] if reward_batch is not None else None,
+                done_batch=done_batch[ids] if done_batch is not None else None,
+                value_head_idx=i % self.value_ensemble_size if self.value_heads is not None else None,
             )
             
             if self.auxiliary_heads is not None:
@@ -475,6 +563,8 @@ class SystemDynamicsEnsemble(nn.Module):
             consistency_losses.append(consistency_loss.unsqueeze(0))
             reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
             encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
+            reward_losses.append(reward_loss.unsqueeze(0))
+            value_losses.append(value_loss.unsqueeze(0))
             extension_losses.append(extension_loss.unsqueeze(0))
             contact_losses.append(contact_loss.unsqueeze(0))
             termination_losses.append(termination_loss.unsqueeze(0))
@@ -486,12 +576,14 @@ class SystemDynamicsEnsemble(nn.Module):
         consistency_loss = torch.mean(torch.cat(consistency_losses, dim=0), dim=0)
         reconstruction_loss = torch.mean(torch.cat(reconstruction_losses, dim=0), dim=0)
         encoder_consistency_loss = torch.mean(torch.cat(encoder_consistency_losses, dim=0), dim=0)
+        reward_loss = torch.mean(torch.cat(reward_losses, dim=0), dim=0)
+        value_loss = torch.mean(torch.cat(value_losses, dim=0), dim=0)
         extension_loss = torch.mean(torch.cat(extension_losses, dim=0), dim=0)
         contact_loss = torch.mean(torch.cat(contact_losses, dim=0), dim=0)
         termination_loss = torch.mean(torch.cat(termination_losses, dim=0), dim=0)
-        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, extension_loss, contact_loss, termination_loss
+        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, reward_loss, value_loss, extension_loss, contact_loss, termination_loss
 
-    def compute_state_loss(self, head, state_batch, action_batch):
+    def compute_state_loss(self, head, state_batch, action_batch, reward_batch=None, done_batch=None, value_head_idx=None):
         """Compute state prediction loss for a single ensemble head.
         
         In latent mode, this computes:
@@ -499,9 +591,24 @@ class SystemDynamicsEnsemble(nn.Module):
         - reconstruction_loss: MSE between decoded prediction and raw target
         - encoder_consistency_loss: (optional) MSE between online encoder output and 
             stop-gradient dynamics prediction (bidirectional, TD-MPC2 style)
+        - reward_loss: (Phase 3) MSE between predicted and actual reward
+        - value_loss: (Phase 3) MSE between predicted value and TD target
         - state_loss: weighted sum of the above (for backward compatibility)
         
-        In raw mode: unchanged from original behavior (consistency/reconstruction/encoder_consistency = 0).
+        In raw mode: unchanged from original behavior (consistency/reconstruction/encoder_consistency/reward/value = 0).
+        
+        Args:
+            head: The dynamics head for this ensemble member.
+            state_batch: [B, seq_len, state_dim] raw state sequences.
+            action_batch: [B, seq_len, action_dim] action sequences.
+            reward_batch: [B, seq_len, 1] reward sequences (optional, Phase 3).
+            done_batch: [B, seq_len, 1] done flag sequences (optional, Phase 3).
+            value_head_idx: Which value head to use for this ensemble member (optional).
+        
+        Returns:
+            Tuple of (state_loss, sequence_loss, bound_loss, kl_loss,
+                      consistency_loss, reconstruction_loss, encoder_consistency_loss,
+                      reward_loss, value_loss).
         """
         forecast_horizon = state_batch.shape[1] - self.history_horizon
         state_losses = []
@@ -511,6 +618,8 @@ class SystemDynamicsEnsemble(nn.Module):
         consistency_losses = []
         reconstruction_losses = []
         encoder_consistency_losses = []
+        reward_losses = []
+        value_losses = []
         
         if self.latent_mode:
             # Encode the full state batch with EMA target encoder for consistency targets
@@ -554,6 +663,44 @@ class SystemDynamicsEnsemble(nn.Module):
                 else:
                     encoder_consistency_loss = torch.tensor(0.0, device=self.device)
                 
+                # --- Phase 3: Reward Loss ---
+                # Predict reward from (z_t, a_t) and compare to actual reward.
+                # The reward head predicts in symlog space to keep loss magnitudes
+                # comparable to the consistency loss on SimNorm-bounded latents.
+                # Latents are detached so reward gradients don't distort the encoder.
+                if self.reward_head is not None and reward_batch is not None:
+                    # Detach latent: reward head reads the latent space, doesn't reshape it
+                    z_current_rv = (x_latent_batch[:, -1] if x_latent_batch.dim() == 3 else x_latent_batch).detach()
+                    a_current = action_batch[:, self.history_horizon + i]
+                    r_actual = reward_batch[:, self.history_horizon + i]  # [B, 1]
+                    
+                    r_pred = self.reward_head(z_current_rv, a_current)  # [B, 1] (symlog space)
+                    reward_loss = torch.square(r_pred - symlog(r_actual)).mean()
+                else:
+                    reward_loss = torch.tensor(0.0, device=self.device)
+                
+                # --- Phase 3: Value Loss ---
+                # TD target: V_target = symlog(r + gamma * (1 - done) * symexp(V_target_ema(z')))
+                # Both prediction and target are in symlog space for scale invariance.
+                # Latents are detached so value gradients don't distort the encoder.
+                if self.value_heads is not None and self.target_value_heads is not None and reward_batch is not None and done_batch is not None and value_head_idx is not None:
+                    z_current_rv = (x_latent_batch[:, -1] if x_latent_batch.dim() == 3 else x_latent_batch).detach()
+                    r_actual = reward_batch[:, self.history_horizon + i]  # [B, 1]
+                    d_actual = done_batch[:, self.history_horizon + i]    # [B, 1]
+                    
+                    # Target value of next state using EMA target value head + target encoder latent
+                    # Bellman backup in real space, then compress to symlog for the loss
+                    with torch.no_grad():
+                        z_next_target = all_latent_targets[:, self.history_horizon + i]  # target encoder's next latent
+                        v_next_symlog = self.target_value_heads.forward_single(z_next_target, value_head_idx)  # [B, 1] symlog space
+                        v_td_target = symlog(r_actual + self.value_gamma * (1.0 - d_actual) * symexp(v_next_symlog))
+                    
+                    # Predicted value of current state (symlog space)
+                    v_pred = self.value_heads.forward_single(z_current_rv, value_head_idx)  # [B, 1]
+                    value_loss = torch.square(v_pred - v_td_target).mean()
+                else:
+                    value_loss = torch.tensor(0.0, device=self.device)
+                
                 # Combined state loss for backward compatibility
                 state_loss = (
                     self.consistency_coef * consistency_loss 
@@ -567,6 +714,8 @@ class SystemDynamicsEnsemble(nn.Module):
                 consistency_losses.append(consistency_loss.unsqueeze(0))
                 reconstruction_losses.append(reconstruction_loss.unsqueeze(0))
                 encoder_consistency_losses.append(encoder_consistency_loss.unsqueeze(0))
+                reward_losses.append(reward_loss.unsqueeze(0))
+                value_losses.append(value_loss.unsqueeze(0))
                 state_losses.append(state_loss.unsqueeze(0))
                 sequence_losses.append(sequence_loss.unsqueeze(0))
                 bound_losses.append(bound_loss.unsqueeze(0))
@@ -604,6 +753,8 @@ class SystemDynamicsEnsemble(nn.Module):
                 consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
                 reconstruction_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
                 encoder_consistency_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                reward_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
+                value_losses.append(torch.tensor(0.0, device=self.device).unsqueeze(0))
                 state_losses.append(state_loss.unsqueeze(0))
                 sequence_losses.append(sequence_loss.unsqueeze(0))
                 bound_losses.append(bound_loss.unsqueeze(0))
@@ -631,7 +782,9 @@ class SystemDynamicsEnsemble(nn.Module):
         consistency_loss = torch.mean(torch.cat(consistency_losses, dim=0), dim=0)
         reconstruction_loss = torch.mean(torch.cat(reconstruction_losses, dim=0), dim=0)
         encoder_consistency_loss = torch.mean(torch.cat(encoder_consistency_losses, dim=0), dim=0)
-        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss
+        reward_loss = torch.mean(torch.cat(reward_losses, dim=0), dim=0)
+        value_loss = torch.mean(torch.cat(value_losses, dim=0), dim=0)
+        return state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, reward_loss, value_loss
 
     def compute_auxiliary_loss(self, head, state_batch, action_batch, extension_batch, contact_batch, termination_batch):
         """Compute auxiliary prediction losses.
@@ -761,4 +914,7 @@ class SystemDynamicsEnsemble(nn.Module):
         # Target encoder should always be in eval mode (no dropout/batchnorm train behavior)
         if self.target_encoder is not None:
             self.target_encoder.eval()
+        # Target value heads should always be in eval mode (EMA targets only)
+        if self.target_value_heads is not None:
+            self.target_value_heads.eval()
         return self

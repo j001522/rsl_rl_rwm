@@ -60,6 +60,7 @@ class MBPOPPO(PPO):
         system_dynamics_num_eval_trajectories=10,
         system_dynamics_len_eval_trajectory=400,
         system_dynamics_eval_traj_noise_scale=[0.1, 0.2, 0.4, 0.5, 0.8],
+        system_dynamics_rv_warmup_steps=0,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -94,8 +95,14 @@ class MBPOPPO(PPO):
         # System dynamics components
         self.system_dynamics = system_dynamics
         self.system_dynamics.to(self.device)
+        # Build replay buffer dim list: [state, action, extension, contact, termination, reward?, done?]
+        replay_dims = [system_dynamics.state_dim, system_dynamics.action_dim, system_dynamics.extension_dim, system_dynamics.contact_dim, system_dynamics.termination_dim]
+        # Phase 3: append reward and done dims if either reward or value heads are enabled
+        self._store_reward_done = system_dynamics.reward_head_enabled or system_dynamics.value_head_enabled
+        if self._store_reward_done:
+            replay_dims.extend([1, 1])  # reward_dim=1, done_dim=1
         self.system_replay_buffer = ReplayBuffer(
-            [system_dynamics.state_dim, system_dynamics.action_dim, system_dynamics.extension_dim, system_dynamics.contact_dim, system_dynamics.termination_dim],
+            replay_dims,
             system_dynamics_replay_buffer_size,
             device
             )
@@ -109,6 +116,9 @@ class MBPOPPO(PPO):
         self.system_dynamics_num_eval_trajectories = system_dynamics_num_eval_trajectories
         self.system_dynamics_len_eval_trajectory = system_dynamics_len_eval_trajectory
         self.system_dynamics_eval_traj_noise_scale = system_dynamics_eval_traj_noise_scale
+        # Phase 3: delay reward/value head gradients for N optimizer steps
+        self.system_dynamics_rv_warmup_steps = system_dynamics_rv_warmup_steps
+        self._rv_step_counter = 0
 
         self.state_normalizer = state_normalizer
         self.action_normalizer = action_normalizer
@@ -160,7 +170,7 @@ class MBPOPPO(PPO):
         self.transition.clear()
         self.policy.reset(dones)
 
-    def fill_history_buffer(self, obs):
+    def fill_history_buffer(self, obs, rewards=None, dones=None):
         system_state = obs["system_state"]
         system_action = obs["system_action"]
         system_extension = obs.get("system_extension")
@@ -169,15 +179,19 @@ class MBPOPPO(PPO):
         system_state = self.state_normalizer(system_state)
         system_action = self.action_normalizer(system_action)
 
-        self.system_replay_buffer.insert(
-            [
-                system_state.unsqueeze(1),
-                system_action.unsqueeze(1),
-                system_extension.unsqueeze(1) if system_extension is not None else None,
-                system_contact.unsqueeze(1) if system_contact is not None else None,
-                system_termination.unsqueeze(1) if system_termination is not None else None,
-                ]
-            )
+        data_list = [
+            system_state.unsqueeze(1),
+            system_action.unsqueeze(1),
+            system_extension.unsqueeze(1) if system_extension is not None else None,
+            system_contact.unsqueeze(1) if system_contact is not None else None,
+            system_termination.unsqueeze(1) if system_termination is not None else None,
+        ]
+        # Phase 3: append reward and done to replay buffer entries
+        if self._store_reward_done:
+            data_list.append(rewards.unsqueeze(1).unsqueeze(-1) if rewards is not None else None)  # [N] -> [N, 1, 1]
+            data_list.append(dones.unsqueeze(1).unsqueeze(-1).float() if dones is not None else None)  # [N] -> [N, 1, 1]
+
+        self.system_replay_buffer.insert(data_list)
 
     def compute_returns(self, obs, imagination=False):
         if imagination:
@@ -200,21 +214,37 @@ class MBPOPPO(PPO):
         mean_system_extension_loss = 0
         mean_system_contact_loss = 0
         mean_system_termination_loss = 0
+        mean_system_reward_loss = 0
+        mean_system_value_loss = 0
         system_generator = self.system_replay_buffer.mini_batch_generator(
             self.system_dynamics.history_horizon + self.system_dynamics_forecast_horizon,
             self.system_dynamics_num_mini_batches,
             self.system_dynamics_mini_batch_size,
         )
-        for system_state_batch, system_action_batch, system_extension_batch, system_contact_batch, system_termination_batch in system_generator:
+        for batch in system_generator:
+            # Unpack batch: first 5 are always [state, action, extension, contact, termination]
+            system_state_batch = batch[0]
+            system_action_batch = batch[1]
+            system_extension_batch = batch[2]
+            system_contact_batch = batch[3]
+            system_termination_batch = batch[4]
+            # Phase 3: reward and done are appended as 6th and 7th entries when enabled
+            system_reward_batch = batch[5] if self._store_reward_done and len(batch) > 5 else None
+            system_done_batch = batch[6] if self._store_reward_done and len(batch) > 6 else None
+
             self.system_dynamics.reset()
-            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, extension_loss, contact_loss, termination_loss = self.system_dynamics.compute_loss(
+            state_loss, sequence_loss, bound_loss, kl_loss, consistency_loss, reconstruction_loss, encoder_consistency_loss, reward_loss, value_loss, extension_loss, contact_loss, termination_loss = self.system_dynamics.compute_loss(
                 system_state_batch,
                 system_action_batch,
                 system_extension_batch,
                 system_contact_batch,
                 system_termination_batch,
+                reward_batch=system_reward_batch,
+                done_batch=system_done_batch,
                 bootstrap=self.system_dynamics.bootstrap
             )
+            # Phase 3: suppress reward/value losses during warmup period
+            rv_active = float(self._rv_step_counter >= self.system_dynamics_rv_warmup_steps)
             loss = (
                 self.system_dynamics_loss_weights["state"] * state_loss
                 + self.system_dynamics_loss_weights["sequence"] * sequence_loss
@@ -223,16 +253,19 @@ class MBPOPPO(PPO):
                 + self.system_dynamics_loss_weights.get("consistency", 0.0) * consistency_loss
                 + self.system_dynamics_loss_weights.get("reconstruction", 0.0) * reconstruction_loss
                 + self.system_dynamics_loss_weights.get("encoder_consistency", 0.0) * encoder_consistency_loss
+                + rv_active * self.system_dynamics_loss_weights.get("reward", 0.0) * reward_loss
+                + rv_active * self.system_dynamics_loss_weights.get("value", 0.0) * value_loss
                 + self.system_dynamics_loss_weights["extension"] * extension_loss
                 + self.system_dynamics_loss_weights["contact"] * contact_loss
                 + self.system_dynamics_loss_weights["termination"] * termination_loss
             )
+            self._rv_step_counter += 1
             self.system_dynamics_optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.system_dynamics.parameters(), self.max_grad_norm)
             self.system_dynamics_optimizer.step()
-            # Update EMA target encoder after each optimizer step
-            self.system_dynamics.update_target_encoder()
+            # Update EMA targets (target encoder + target value heads) after each optimizer step
+            self.system_dynamics.update_targets()
             mean_system_state_loss += state_loss.item()
             mean_system_sequence_loss += sequence_loss.item()
             mean_system_bound_loss += bound_loss.item()
@@ -240,6 +273,8 @@ class MBPOPPO(PPO):
             mean_system_consistency_loss += consistency_loss.item()
             mean_system_reconstruction_loss += reconstruction_loss.item()
             mean_system_encoder_consistency_loss += encoder_consistency_loss.item()
+            mean_system_reward_loss += reward_loss.item()
+            mean_system_value_loss += value_loss.item()
             mean_system_extension_loss += extension_loss.item()
             mean_system_contact_loss += contact_loss.item()
             mean_system_termination_loss += termination_loss.item()
@@ -252,10 +287,12 @@ class MBPOPPO(PPO):
         mean_system_consistency_loss /= system_dynamics_num_updates
         mean_system_reconstruction_loss /= system_dynamics_num_updates
         mean_system_encoder_consistency_loss /= system_dynamics_num_updates
+        mean_system_reward_loss /= system_dynamics_num_updates
+        mean_system_value_loss /= system_dynamics_num_updates
         mean_system_extension_loss /= system_dynamics_num_updates
         mean_system_contact_loss /= system_dynamics_num_updates
         mean_system_termination_loss /= system_dynamics_num_updates
-        return mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss
+        return mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_consistency_loss, mean_system_reconstruction_loss, mean_system_encoder_consistency_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss, mean_system_reward_loss, mean_system_value_loss
     
     def evaluate_system_dynamics(self):
         system_generator = self.system_replay_buffer.mini_batch_generator(
@@ -263,7 +300,7 @@ class MBPOPPO(PPO):
             1,
             self.system_dynamics_num_eval_trajectories,
         )
-        state_traj, action_traj, extension_traj, contact_traj, termination_traj = next(system_generator)
+        state_traj, action_traj, extension_traj, contact_traj, termination_traj = next(system_generator)[:5]
         state_traj_pred, _, _, action_traj_pred, extension_traj_pred, contact_traj_pred, termination_traj_pred = self.system_dynamics_autoregressive_prediction(state_traj, action_traj, extension_traj, contact_traj, termination_traj)
         traj_autoregressive_error = ((state_traj_pred[:, self.system_dynamics.history_horizon:] - state_traj[:, self.system_dynamics.history_horizon:]).abs().sum(dim=-1) / state_traj[:, self.system_dynamics.history_horizon:].abs().sum(dim=-1)).mean().item()
         traj_autoregressive_error_noised_dict = {}

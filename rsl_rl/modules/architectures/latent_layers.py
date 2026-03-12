@@ -14,6 +14,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """Symmetric logarithmic transform: sign(x) * ln(1 + |x|).
+    
+    Compresses large magnitudes while preserving sign. Smooth near zero.
+    Used to normalize reward and value targets so their MSE loss stays
+    on a comparable scale to latent-space consistency losses.
+    
+    Reference: TD-MPC2 (Hansen et al., 2024)
+    """
+    return torch.sign(x) * torch.log1p(x.abs())
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """Inverse of symlog: sign(x) * (exp(|x|) - 1).
+    
+    Recovers the original scale from symlog-compressed values.
+    """
+    return torch.sign(x) * (torch.exp(x.abs()) - 1)
+
+
 class SimNorm(nn.Module):
     """Simplicial normalization.
     
